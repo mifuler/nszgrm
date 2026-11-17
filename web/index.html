@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>中文姓名音译与语言线索 · 本地训练模型</title>
+<style>
+:root {color-scheme:light;--ink:#202c3d;--muted:#607087;--line:#dfe7f0;--blue:#23599e}
+*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:var(--ink);font:15px/1.7 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+main{max-width:940px;margin:38px auto;padding:0 15px}h1{font-size:27px;margin:0}h2{font-size:17px;margin:0 0 15px}p{color:var(--muted)}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:22px;margin:15px 0;box-shadow:0 6px 21px #172d4806}
+.row{display:flex;flex-wrap:wrap;gap:9px}.row>*{min-width:0}input,textarea{border:1px solid #b9c9dc;border-radius:8px;padding:11px;font:inherit;flex:1}input{font-size:21px}textarea{display:block;width:100%;height:115px}
+button{border:0;border-radius:8px;padding:10px 17px;background:var(--blue);color:#fff;cursor:pointer;font:inherit}button:disabled{background:#bdc8d4}.tag{font-size:12px;border:1px solid var(--line);background:#eef4fd;color:#27548c;padding:4px 9px;border-radius:18px;cursor:pointer}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mini{background:#f6f8fb;padding:13px 15px;border-radius:8px}.large{font-size:40px;font-weight:750}.small{font-size:12px;color:var(--muted)}
+.bar{height:10px;background:#e7edf5;border-radius:6px;overflow:hidden}.fill{height:100%;background:#467bb8}.result-row{display:flex;gap:10px;align-items:center;margin:8px 0}.result-row .name{width:120px;font-size:13px}.result-row .bar{flex:1}.result-row .pct{width:55px;text-align:right;font-variant-numeric:tabular-nums}
+code{font-family:ui-monospace,Consolas,monospace}.warn{color:#9d6524}.hint{background:#f8fafc;padding:12px;border-radius:8px}footer{color:var(--muted);font-size:12px;margin:18px 0 35px}
+@media(max-width:600px){.grid{grid-template-columns:1fr}main{margin-top:20px}.card{padding:17px}.large{font-size:36px}}
+</style>
+</head>
+<body><main><h1>中文姓名音译与语言线索</h1>
+<p>GitHub Actions 训练的离线模型 · 浏览器本地计算 · 无联网请求</p>
+<section class="card"><h2>单个姓名</h2><div class="row"><input id="name" value="布莱恩" maxlength="16" autocomplete="off" aria-label="输入姓名"><button id="run">分析</button></div>
+<div class="row" style="margin-top:12px"><button class="tag" data-name="布莱恩">布莱恩</button><button class="tag" data-name="李白">李白</button><button class="tag" data-name="山田太郎">山田太郎</button><button class="tag" data-name="安娜">安娜</button><button class="tag" data-name="彼得">彼得</button></div></section>
+<section class="card"><h2>检测结果</h2><div class="grid"><div class="mini"><div class="small">音译指数（语料内模型分数）</div><div class="large" id="score">—</div><div id="decision"></div></div><div class="mini"><div class="small">主要书写类型</div><div class="large" style="font-size:23px;margin:14px 0" id="type">—</div><div class="small" id="confidence"></div></div></div><div id="type-detail"></div><h2 style="margin-top:19px">可能的语言线索</h2><div id="lang-detail">—</div><p class="warn" id="warning"></p></section>
+<section class="card"><h2>本次判断的主要字符组合</h2><div id="features" class="small">—</div><p class="small">贡献值来自量化后的线性分类器权重；多分类校准器可能改变最终概率排序。</p></section>
+<section class="card"><h2>批量检测</h2><p>每行一个姓名（TXT、CSV 第一列，或直接粘贴）。只在当前浏览器处理，下载结果为 CSV。</p><textarea id="batch" placeholder="李白&#10;布莱恩&#10;山田太郎"></textarea>
+<div class="row" style="margin-top:10px"><input type="file" id="file" accept=".txt,.csv,text/plain,text/csv"><button id="batch-run">批量检测并导出</button></div><p id="batch-status" class="small"></p></section>
+<footer>字典和数据集由各自提供者维护。使用的是语料弱监督标签：汉字书写模式与人物母语代理数据，不能证明一个姓名的真实词源。若语言证据不足，结果会明确显示无法判断。</footer>
+</main><script src="models.js"></script><script>
+(() => {
+'use strict';
+const labels={zh_native:'中国本土姓名模式',foreign_phonetic_proxy:'外国译名/音译模式',ja_kanji_proxy:'日本姓名汉字表记模式'};
+const langs={en:'英语',ru:'俄语',ja:'日语',fr:'法语',es:'西班牙语',de:'德语',ko:'韩语'};
+const models=window.CHINESE_NAME_TRAINED_MODELS || {};
+const decoder={};
+function prep(model){
+ if(model._prepared)return;
+ model._prepared=true; model._lookup=new Map(model.vocabulary.map((term,i)=>[term,i]));
+ model._weights=model.weights_base64.map(b=>{
+   const bytes=atob(b);
+   if(model.weight_dtype==='int16'){
+     const buf=new ArrayBuffer(bytes.length), u=new Uint8Array(buf);
+     for(let i=0;i<bytes.length;i++)u[i]=bytes.charCodeAt(i);
+     const view=new DataView(buf), arr=new Int16Array(bytes.length/2);
+     for(let i=0;i<arr.length;i++)arr[i]=view.getInt16(i*2,true);
+     return arr;
+   }
+   const arr=new Int8Array(bytes.length);
+   for(let i=0;i<bytes.length;i++)arr[i]=(bytes.charCodeAt(i)<<24)>>24;
+   return arr;
+ });
+}
+function normalize(text){const t=text.normalize('NFKC').trim();return /^[\u3400-\u9fff]{2,8}$/u.test(t)?t:null}
+function score(model,name){
+ prep(model);const chars=Array.from('^'+name+'$'),found=new Set();
+ for(let j=0;j<chars.length;j++)for(let n=1;n<=3&&j+n<=chars.length;n++){
+   const feature=chars.slice(j,j+n).join('');const idx=model._lookup.get(feature);
+   if(idx!==undefined)found.add(idx);
+ }
+ const raw=model.bias.map((bias,j)=>{let z=bias,w=model._weights[j],scale=model.scales[j];for(const i of found)z+=w[i]*scale;return z});
+ const cal=model.calibration;let logits=cal.coef.map((row,j)=>row.reduce((sum,v,i)=>sum+v*raw[i],cal.intercept[j]));
+ let probs;if(logits.length===1){const p=1/(1+Math.exp(-Math.max(-35,Math.min(35,logits[0]))));probs=[1-p,p]}
+ else{let mx=Math.max(...logits),exp=logits.map(v=>Math.exp(v-mx)),sum=exp.reduce((a,b)=>a+b,0);probs=exp.map(x=>x/sum)}
+ const items=cal.classes.map((label,i)=>({label,prob:probs[i]}));items.sort((a,b)=>b.prob-a.prob);
+ const predictedIndex=cal.classes.indexOf(items[0].label);
+ const row=model._weights[Math.min(predictedIndex, model._weights.length-1)];
+ const impacts=[...found].map(i=>({term:model.vocabulary[i],effect:row[i]*model.scales[Math.min(predictedIndex,model.scales.length-1)]})).sort((a,b)=>Math.abs(b.effect)-Math.abs(a.effect));
+ return {items,impacts};
+}
+function infer(text){const name=normalize(text);if(!name)return{error:'只支持 2—8 个连续汉字的单个姓名或姓名成分。'};
+ if(!models.writing_type)return{error:'未找到写法识别模型，请确认 models.js 与 index.html 在同一目录。'};
+ const writing=score(models.writing_type,name);
+ const phonetic=writing.items.find(x=>x.label==='foreign_phonetic_proxy')?.prob ?? 0;
+ let language=null;
+ if(models.language_proxy)language=score(models.language_proxy,name);
+ return {name,phonetic,writing,language};
+}
+const $=id=>document.getElementById(id);
+function escapeHtml(t){return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function bars(items,names){return items.map(x=>'<div class="result-row"><div class="name">'+escapeHtml(names[x.label]||x.label)+'</div><div class="bar"><div class="fill" style="width:'+(x.prob*100).toFixed(1)+'%"></div></div><span class="pct">'+(x.prob*100).toFixed(1)+'%</span></div>').join('')}
+function render(){const r=infer($('name').value);if(r.error){$('score').textContent='—';$('type').textContent='无法分析';$('warning').textContent=r.error;return}
+ $('score').textContent=(r.phonetic*100).toFixed(1);$('decision').textContent=r.phonetic>=.5?'具有音译型特征':'音译型特征较弱';
+ $('type').textContent=labels[r.writing.items[0].label] || r.writing.items[0].label;
+ $('confidence').textContent='模型类别分数 '+(r.writing.items[0].prob*100).toFixed(1)+'%';
+ $('type-detail').innerHTML=bars(r.writing.items,labels);
+ const localNative=r.writing.items[0].label==='zh_native' && r.writing.items[0].prob>=.55;
+ $('lang-detail').innerHTML=localNative?'当前更符合中文本土姓名模式，不进行外国语言来源猜测。':(r.language?bars(r.language.items,langs)+'<p class="small">来自人物母语 P103 的弱监督代理；不等同姓名词源。最高分低于65%时拒绝确定语言来源。</p>':'当前训练没有取得足够多语言样本，未建立语言分类器。');
+ $('warning').textContent=(r.writing.items[0].prob<.60?'写法模式区分度有限。 ':'')+(!localNative&&r.language&&r.language.items[0].prob<.65?'语言线索区分度不足，无法可靠判断。':'');
+ $('features').textContent=r.writing.impacts.slice(0,15).map(x=>x.term+' ('+(x.effect>=0?'+':'')+x.effect.toFixed(3)+')').join('  ·  ');
+}
+$('run').onclick=render;$('name').addEventListener('input',render);
+document.querySelectorAll('[data-name]').forEach(b=>b.onclick=()=>{$('name').value=b.dataset.name;render()});
+$('file').onchange=async e=>{const f=e.target.files?.[0];if(f){$('batch').value=await f.text();$('batch-status').textContent='已读取 '+f.name;}};
+function csvEscape(s){return '"'+String(s).replace(/"/g,'""')+'"'}
+$('batch-run').onclick=()=>{
+ const list=$('batch').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).map(x=>x.split(',')[0].replace(/^"|"$/g,''));
+ if(!list.length){$('batch-status').textContent='请先输入姓名。';return}
+ const rows=[['姓名','音译指数','最高书写类别','最高书写分数','候选语言','语言分数','提示']];
+ for(const name of list){const r=infer(name);
+  if(r.error){rows.push([name,'','','','','',r.error]);continue}
+  const localNative=r.writing.items[0].label==='zh_native' && r.writing.items[0].prob>=.55;
+  rows.push([name,(r.phonetic*100).toFixed(2),r.writing.items[0].label,(r.writing.items[0].prob*100).toFixed(2),
+    localNative?'不适用':(r.language?(r.language.items[0].prob>=.65?r.language.items[0].label:'无法可靠判断'):'无语言模型'),
+    !localNative&&r.language?(r.language.items[0].prob*100).toFixed(2):'', '弱监督模型，不是词源证明']);
+ }
+ const data='\ufeff'+rows.map(r=>r.map(csvEscape).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([data],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download='姓名音译检测结果.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ $('batch-status').textContent='已处理 '+list.length+' 个姓名。';
+};
+render();
+})();
+</script></body></html>

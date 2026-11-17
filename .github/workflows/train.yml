@@ -1,0 +1,112 @@
+name: Train Chinese-name models (CPU / Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_per_class:
+        description: '每种书写类型训练池上限；0 为不限量（更耗时）'
+        required: true
+        default: '120000'
+        type: choice
+        options: ['20000','60000','120000','0']
+      wikidata:
+        description: '多语言母语代理数据：best_effort 遇到接口故障时仍交付主模型'
+        required: true
+        default: best_effort
+        type: choice
+        options: [best_effort, required, 'off']
+      publish_release:
+        description: '训练成功后自动发布 Release 长期保存模型和报告（仅模型，不含原始语料）'
+        required: true
+        default: true
+        type: boolean
+      max_features:
+        description: '字符 n-gram 特征数量'
+        required: true
+        default: '35000'
+        type: choice
+        options: ['15000','35000','60000']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chinese-name-training-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PYTHONUNBUFFERED: '1'
+      OPENBLAS_NUM_THREADS: '2'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - name: Checkout training package
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Run deterministic offline smoke tests
+        run: python -m unittest discover -s tests -v
+      - name: Download public corpora and train models
+        run: |
+          python src/pipeline.py \
+            --output outputs \
+            --cache .cache/data \
+            --max-per-class "${{ inputs.max_per_class }}" \
+            --max-features "${{ inputs.max_features }}" \
+            --wikidata "${{ inputs.wikidata }}" \
+            --wikidata-limit 1200 \
+            --seed 20261117
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f outputs/REPORT.md ]; then
+            cat outputs/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' '训练未完成：请查看前面的失败步骤与日志。' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload trained models and evaluation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinese-name-models-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30
+          if-no-files-found: warn
+
+  publish_release:
+    needs: train
+    if: ${{ inputs.publish_release == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download trained model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: chinese-name-models-${{ github.run_id }}
+          path: outputs
+      - name: Package and publish a non-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -f outputs/REPORT.md
+          zip -q -r "trained-models-${GITHUB_RUN_ID}.zip" outputs
+          gh release create "training-${GITHUB_RUN_ID}" \
+            "trained-models-${GITHUB_RUN_ID}.zip" \
+            --title "中文姓名模型训练结果 · Run ${GITHUB_RUN_ID}" \
+            --notes-file outputs/REPORT.md \
+            --latest=false
