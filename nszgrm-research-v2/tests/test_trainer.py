@@ -57,6 +57,65 @@ class TrainerTests(unittest.TestCase):
             self.assertEqual(rows,[('Q123','林肯')])
             self.assertEqual(json.loads(cached.read_text(encoding='utf-8'))['results']['bindings'][0]['name']['value'],'林肯')
 
+    def test_wikidata_unescaped_control_character_parses_but_is_filtered(self):
+        import json
+        from corpus import _read_wikidata_payload,_wikidata_json_rows
+        with tempfile.TemporaryDirectory() as temp:
+            file=Path(temp)/'bad_control.json'
+            rows=[{'person':{'value':'https://www.wikidata.org/entity/Q7'},
+                   'name':{'value':'汉\x0b字'}},
+                  {'person':{'value':'https://www.wikidata.org/entity/Q8'},
+                   'name':{'value':'林肯'}}]
+            # Insert actual VT, not the legal escaped JSON representation.
+            raw=json.dumps({'results':{'bindings':rows}},ensure_ascii=False)
+            file.write_text(raw.replace('\\u000b','\x0b'),encoding='utf8')
+            with self.assertRaises(json.JSONDecodeError):
+                json.loads(file.read_bytes())
+            output=_wikidata_json_rows(_read_wikidata_payload(file))
+            self.assertEqual(output,[('Q8','林肯')])
+            rows[0]['name']['value']='\x0b林肯'
+            self.assertEqual(_wikidata_json_rows({'results':{'bindings':rows}}),[('Q8','林肯')])
+
+    def test_wikidata_truncated_json_still_rejected(self):
+        from corpus import _read_wikidata_payload
+        with tempfile.TemporaryDirectory() as temp:
+            file=Path(temp)/'truncated.json'
+            file.write_bytes(b'{"results":{"bindings":[{"person":{"value":"x"}')
+            with self.assertRaises(ValueError):
+                _read_wikidata_payload(file)
+
+    def test_wikidata_csv_alternative_parsing(self):
+        from corpus import _read_wikidata_csv
+        with tempfile.TemporaryDirectory() as temp:
+            file=Path(temp)/'response.csv'
+            file.write_text('person,name\nhttps://www.wikidata.org/entity/Q10,"林,肯"\n'
+                            'https://www.wikidata.org/entity/Q11,林肯\n',encoding='utf8')
+            self.assertEqual(_read_wikidata_csv(file),[('Q11','林肯')])
+
+    def test_wikidata_invalid_json_falls_back_to_csv(self):
+        import json
+        from corpus import fetch_wikidata
+        class FakeResponse:
+            def __init__(self,payload):self.payload=payload
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self):return self.payload
+        csv_payload=('person,name\nhttps://www.wikidata.org/entity/Q12,林肯\n').encode()
+        calls=[]
+        def mock_get(request, timeout):
+            calls.append(request.full_url)
+            if 'format=csv' in request.full_url:
+                return FakeResponse(csv_payload)
+            return FakeResponse(b'{"results":')
+        with tempfile.TemporaryDirectory() as temp:
+            with patch('corpus.shutil.which',return_value=None), \
+                 patch('corpus.urllib.request.urlopen',side_effect=mock_get), \
+                 patch('corpus.time.sleep',return_value=None):
+                rows=fetch_wikidata('de','Q188',5000,Path(temp))
+            self.assertEqual(rows,[('Q12','林肯')])
+            self.assertTrue(any('format=csv' in u for u in calls))
+            self.assertTrue((Path(temp)/'P103_de_Q188_5000.csv').is_file())
+
     def test_language_model_has_eight_classes_including_chinese(self):
         self.assertEqual(set(LANGS), {'zh','en','fr','de','es','ru','ja','ko'})
         self.assertEqual(len(LANGS), 8)

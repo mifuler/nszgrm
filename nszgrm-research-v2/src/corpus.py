@@ -180,12 +180,73 @@ def _wd_query(lang_qid: str, limit: int):
 
 
 def _read_wikidata_payload(path: Path):
-    raw=json.loads(path.read_text(encoding='utf8'))
+    """Parse SPARQL JSON, tolerating unescaped C0 bytes *inside* JSON strings.
+
+    Wikidata occasionally emits raw control characters in label values. A strict
+    parser rejects the entire result, even though all other rows are complete.
+    strict=False only relaxes that one JSON-string rule: truncated responses,
+    broken structure and non-UTF-8 bytes still cause validation failures.
+    The downstream Han-only name filter rejects any contaminated name.
+    """
+    payload=path.read_bytes()
+    try:
+        raw=json.loads(payload)
+    except json.JSONDecodeError as exc:
+        if 'Invalid control character' not in exc.msg:
+            raise
+        raw=json.loads(payload,strict=False)
+        print('[wikidata] accepted structurally complete JSON containing '
+              'an unescaped control character; affected names will be filtered',
+              flush=True)
     if not isinstance(raw,dict) or not isinstance(raw.get('results'),dict):
         raise ValueError('Wikidata response has no results object')
-    if not isinstance(raw['results'].get('bindings'),list):
+    bindings=raw['results'].get('bindings')
+    if not isinstance(bindings,list):
         raise ValueError('Wikidata response has no bindings list')
+    # Do not quietly cache an HTML error page, a partial structure or malformed
+    # per-row SPARQL bindings. A valid result may be small, so do not impose a
+    # minimum cardinality here; language_records performs eligibility checks.
+    for i,row in enumerate(bindings):
+        if not isinstance(row,dict):
+            raise ValueError(f'Wikidata row {i} is not an object')
+        for key in ('person','name'):
+            cell=row.get(key)
+            if not isinstance(cell,dict) or not isinstance(cell.get('value'),str):
+                raise ValueError(f'Wikidata row {i} has no {key}.value')
     return raw
+
+
+def _read_wikidata_csv(path: Path):
+    """Alternative SPARQL serialization, bypassing JSON label-escaping errors."""
+    raw=path.read_bytes().decode('utf-8-sig')
+    reader=csv.DictReader(io.StringIO(raw,newline=''),strict=True)
+    if not reader.fieldnames or not {'person','name'}.issubset(reader.fieldnames):
+        raise ValueError('Wikidata CSV has unexpected headers')
+    result=set()
+    for i,row in enumerate(reader):
+        if None in row or row.get('person') is None or row.get('name') is None:
+            raise ValueError(f'Wikidata CSV has malformed row {i+2}')
+        person=row['person'].rsplit('/',1)[-1]
+        if any(ord(ch)<32 for ch in row['name']):
+            continue  # Reject control-bearing labels before strip()/NFKC.
+        name=norm_name(row['name'])
+        if name and re.fullmatch(r'Q[1-9]\d*',person):
+            result.add((person,name))
+    if not result:
+        raise ValueError('Wikidata CSV has no valid Han names; refusing to cache')
+    return sorted(result)
+
+
+def _wikidata_json_rows(raw):
+    result=set()
+    for row in raw['results']['bindings']:
+        if any(ord(ch)<32 for ch in row['name']['value']):
+            continue  # strip() would otherwise hide leading/trailing controls.
+        name=norm_name(row['name']['value'])
+        entity=row['person']['value'].rsplit('/',1)[-1]
+        if name and re.fullmatch(r'Q[1-9]\d*',entity):
+            result.add((entity,name))
+    return sorted(result)
 
 
 def _aria2_download(url: str, dest: Path, headers: dict[str,str] | None = None):
@@ -193,8 +254,8 @@ def _aria2_download(url: str, dest: Path, headers: dict[str,str] | None = None):
     exe=shutil.which('aria2c')
     if not exe:
         raise FileNotFoundError('aria2c is not installed')
-    headers=headers or {'User-Agent':'NSZGRMNameResearch/3.1 (https://github.com/mifuler/nszgrm)',
-                         'Accept':'application/sparql-results+json'}
+    headers=headers or {'User-Agent':'NSZGRMNameResearch/3.1.1 (https://github.com/mifuler/nszgrm)',
+                        'Accept':'application/sparql-results+json'}
     cmd=[exe,'--max-tries=4','--retry-wait=5','--timeout=150',
          '--connect-timeout=30','--file-allocation=none',
          '--allow-overwrite=true','--auto-file-renaming=false',
@@ -208,66 +269,67 @@ def _aria2_download(url: str, dest: Path, headers: dict[str,str] | None = None):
 
 def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path):
     cache.mkdir(parents=True,exist_ok=True)
-    path=cache/f'P103_{lang}_{qid}_{max_rows}.json'
-    raw=None
-    if path.is_file():
-        try:
-            raw=_read_wikidata_payload(path)
-        except (OSError,ValueError,json.JSONDecodeError):
-            print(f'[wikidata] discard incomplete cache: {path.name}',flush=True)
-            path.unlink(missing_ok=True)
-    if raw is None:
-        url='https://query.wikidata.org/sparql?'+urllib.parse.urlencode(
-            {'query':_wd_query(qid,max_rows),'format':'json'})
-        headers={'User-Agent':'NSZGRMNameResearch/3.1 (https://github.com/mifuler/nszgrm)',
-                 'Accept':'application/sparql-results+json'}
-        last_error=None
-        part=path.with_name(path.name+'.part')
-        for attempt in range(6):
-            part.unlink(missing_ok=True)
-            if shutil.which('aria2c'):
-                try:
-                    _aria2_download(url,part,headers)
-                    raw=_read_wikidata_payload(part)
-                    os.replace(part,path)
-                    print(f'[wikidata] aria2 download complete: {lang}/{qid} '
-                          f'({len(raw["results"]["bindings"])} rows)',flush=True)
-                    break
-                except Exception as e:
-                    last_error=e
-                    part.unlink(missing_ok=True)
-                    print(f'[wikidata] aria2 attempt {attempt+1}/6 failed: {str(e)[:180]}',flush=True)
+    prefix=f'P103_{lang}_{qid}_{max_rows}'
+    json_path=cache/(prefix+'.json')
+    csv_path=cache/(prefix+'.csv')
+    for path,parser in ((json_path,_read_wikidata_payload),
+                        (csv_path,_read_wikidata_csv)):
+        if path.is_file():
             try:
-                req=urllib.request.Request(url,headers=headers)
-                with urllib.request.urlopen(req,timeout=180) as resp:
-                    payload=resp.read()
-                parsed=json.loads(payload.decode('utf8'))
-                if not isinstance(parsed,dict) or not isinstance(parsed.get('results'),dict) \
-                        or not isinstance(parsed['results'].get('bindings'),list):
-                    raise ValueError('Wikidata returned an invalid SPARQL JSON document')
-                part.write_bytes(payload)
-                os.replace(part,path)
-                raw=parsed
-                print(f'[wikidata] urllib download complete: {lang}/{qid} '
-                      f'({len(raw["results"]["bindings"])} rows)',flush=True)
-                break
-            except (OSError,ValueError,UnicodeError,http.client.HTTPException,
-                    urllib.error.URLError,TimeoutError) as e:
+                content=parser(path)
+                print(f'[wikidata] verified cached {path.name}',flush=True)
+                return _wikidata_json_rows(content) if path.suffix=='.json' else content
+            except (OSError,ValueError,UnicodeError,csv.Error):
+                print(f'[wikidata] discard invalid cache: {path.name}',flush=True)
+                path.unlink(missing_ok=True)
+
+    query=_wd_query(qid,max_rows)
+    last_error=None
+    # Two JSON attempts, then switch serialization to CSV. Retries therefore
+    # change the actual data representation, instead of repeating a broken JSON.
+    for attempt in range(6):
+        csv_mode=(attempt>=2)
+        format_='csv' if csv_mode else 'json'
+        dest=csv_path if csv_mode else json_path
+        parser=_read_wikidata_csv if csv_mode else _read_wikidata_payload
+        headers={'User-Agent':'NSZGRMNameResearch/3.1.1 (https://github.com/mifuler/nszgrm)',
+                 'Accept':'text/csv' if csv_mode else 'application/sparql-results+json'}
+        url='https://query.wikidata.org/sparql?'+urllib.parse.urlencode(
+            {'query':query,'format':format_})
+        part=dest.with_name(dest.name+'.part')
+        part.unlink(missing_ok=True)
+        for client in ('aria2','urllib'):
+            if client=='aria2' and not shutil.which('aria2c'):
+                continue
+            try:
+                if client=='aria2':
+                    _aria2_download(url,part,headers)
+                else:
+                    req=urllib.request.Request(url,headers=headers)
+                    with urllib.request.urlopen(req,timeout=180) as response:
+                        payload=response.read()
+                    part.write_bytes(payload)
+                content=parser(part)
+                result=(_wikidata_json_rows(content) if not csv_mode else content)
+                if not result:
+                    raise ValueError('No valid Han names in Wikidata response')
+                os.replace(part,dest)
+                print(f'[wikidata] {client} verified {lang}/{qid} '
+                      f'({len(result)} names; format={format_})',flush=True)
+                return result
+            except (OSError,ValueError,UnicodeError,csv.Error,
+                    http.client.HTTPException,urllib.error.URLError,
+                    subprocess.CalledProcessError,subprocess.TimeoutExpired,TimeoutError) as e:
                 last_error=e
                 part.unlink(missing_ok=True)
-                if attempt<5:
-                    delay=min(60,5*(2**attempt))+random.uniform(0,2)
-                    print(f'[wikidata] retry {attempt+1}/6 in {delay:.1f}s: {str(e)[:180]}',flush=True)
-                    time.sleep(delay)
-        if raw is None:
-            raise RuntimeError(f'{lang}/{qid}: Wikidata download failed after 6 attempts: {last_error}')
-    out=set()
-    for row in raw.get('results',{}).get('bindings',[]):
-        name=norm_name(row.get('name',{}).get('value',''))
-        entity=row.get('person',{}).get('value','').rsplit('/',1)[-1]
-        if name and re.fullmatch(r'Q[1-9]\d*',entity):
-            out.add((entity,name))
-    return sorted(out)
+                print(f'[wikidata] {client} {format_} attempt {attempt+1}/6: '
+                      f'{str(e)[:190]}',flush=True)
+        if attempt<5:
+            delay=min(30,3*(2**attempt))+random.uniform(0,1)
+            print(f'[wikidata] retry with {"CSV" if attempt>=1 else "JSON"} '
+                  f'after {delay:.1f}s',flush=True)
+            time.sleep(delay)
+    raise RuntimeError(f'{lang}/{qid}: Wikidata JSON and CSV failed after 6 attempts: {last_error}')
 
 def language_records(cache: Path, gold: list[dict], max_rows: int, mode: str, seed: int,
                      min_per_language: int = 80):

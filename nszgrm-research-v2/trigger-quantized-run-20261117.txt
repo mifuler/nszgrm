@@ -1,1 +1,1 @@
-One-off push trigger for the NSZGRM v3.1 robust-download and quantized-model training run.
+NSZGRM v3.1.1: handle unescaped Wikidata JSON control characters, add CSV fallback, and cache verified language downloads.

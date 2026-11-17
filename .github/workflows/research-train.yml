@@ -85,6 +85,13 @@ jobs:
             --vocab-limit 150 --embedding-dim 16 --cnn-channels 16 \
             --gru-hidden 16 --batch-size 128
           python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language --skip-quantized
+      - name: Restore verified Wikidata language cache
+        uses: actions/cache/restore@v4
+        with:
+          path: nszgrm-research-v2/.cache/nszgrm/wikidata/
+          key: nszgrm-wikidata-v3.1.1-${{ github.run_id }}
+          restore-keys: |
+            nszgrm-wikidata-v3.1.1-
       - name: Acquire public corpora; train models; evaluate held-out data
         run: |
           rm -f .cache/quant_eval_samples.json
@@ -148,6 +155,12 @@ jobs:
           else
             python tests/verify_outputs.py outputs
           fi
+      - name: Save validated Wikidata language cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: nszgrm-research-v2/.cache/nszgrm/wikidata/
+          key: nszgrm-wikidata-v3.1.1-${{ github.run_id }}
       - name: Job summary
         if: always()
         run: |
