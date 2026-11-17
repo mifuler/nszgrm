@@ -1,10 +1,12 @@
-name: NSZGRM research ensemble (FP32 <= 200 MB; quantized < 15 MB; 3 writing + 8 language)
+name: NSZGRM v3.2 (3 writing + 8 languages; FP32 and <15 MB quantized)
 
 on:
   push:
     branches: [main]
     paths:
       - 'nszgrm-research-v2/trigger-quantized-run-20261117.txt'
+      - 'nszgrm-research-v2/src/**'
+      - '.github/workflows/research-train.yml'
   workflow_dispatch:
     inputs:
       max_per_class:
@@ -49,6 +51,8 @@ jobs:
     name: Supervised training + validation (Linux CPU)
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    permissions:
+      contents: write  # Append validated Wikidata responses to the dedicated cache Release.
     defaults:
       run:
         working-directory: nszgrm-research-v2
@@ -92,6 +96,13 @@ jobs:
           key: nszgrm-wikidata-v3.1.1-${{ github.run_id }}
           restore-keys: |
             nszgrm-wikidata-v3.1.1-
+      - name: Restore persistent verified Wikidata snapshot from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python src/release_dataset_cache.py restore \
+            --root .cache/nszgrm/wikidata --tag nszgrm-wikidata-cache-v2
       - name: Acquire public corpora; train models; evaluate held-out data
         run: |
           rm -f .cache/quant_eval_samples.json
@@ -161,6 +172,14 @@ jobs:
         with:
           path: nszgrm-research-v2/.cache/nszgrm/wikidata/
           key: nszgrm-wikidata-v3.1.1-${{ github.run_id }}
+      - name: Publish verified Wikidata responses to persistent Release (even on training failure)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python src/release_dataset_cache.py publish \
+            --root .cache/nszgrm/wikidata --tag nszgrm-wikidata-cache-v2
       - name: Job summary
         if: always()
         run: |

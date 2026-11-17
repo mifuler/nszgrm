@@ -1,1 +1,1 @@
-NSZGRM v3.1.1: handle unescaped Wikidata JSON control characters, add CSV fallback, and cache verified language downloads.
+NSZGRM v3.2.0 eight-language P103 Chinese label/alias enrichment, P1412 constrained auxiliary and persistent Release cache.

@@ -124,3 +124,7 @@ INT16 使用 `sym_int16_per_row_v1`，其余字段相同。`data_b64` 按 C-orde
 TF-IDF 的 vocabulary、idf、偏置、温度和融合权重保留原结构与 FP32 数值；ComplementNB 的 `feature_log_prob`、线性模型的 `coef`、CNN/BiGRU 的二维及以上 state 权重会量化。CNN/BiGRU 的一维 bias 保留 FP32。
 
 量化文件硬上限为 15,000,000 字节（严格小于）。训练器对每个模型和融合结果分别计算相对 Accuracy 与 Macro-F1 损耗，门槛均为 10%。INT8 不通过时按模型回退 INT16 并重新评测。评测数据来自训练过程预留的弱标签测试划分，不是人工金标准。
+
+### v3.2 数据来源补充
+
+模型的 8 个语言类别未改变。训练报告 `data_sources.language.supplementary` 记录 P103 中文别名增加数量与 P1412 后备数量；`auxiliary_training_rows` 表示缺少 P103 母语证据的人物使用 P1412 进行语言能力弱监督的样本数。此信息不改变类别顺序或模型推理公式。

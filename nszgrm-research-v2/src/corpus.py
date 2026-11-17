@@ -267,9 +267,33 @@ def _aria2_download(url: str, dest: Path, headers: dict[str,str] | None = None):
                    stderr=subprocess.PIPE)
 
 
-def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path):
+def _wd_query_expanded(qid: str, limit: int, *, source_property: str = 'P103'):
+    """Return Chinese labels/aliases for persons with an explicitly linked language.
+
+    P1412 is allowed only as a marked lower-confidence fallback. When used,
+    require *no* P103 mother-tongue statement rather than guessing a person's
+    native language from language proficiency or citizenship.
+    """
+    if source_property not in ('P103','P1412'):
+        raise ValueError('Only P103/P1412 language evidence is supported')
+    restriction = ('FILTER NOT EXISTS { ?person wdt:P103 ?nativeLanguage . }'
+                   if source_property == 'P1412' else '')
+    return f"""SELECT DISTINCT ?person ?name WHERE {{
+      ?person wdt:P31 wd:Q5; wdt:{source_property} wd:{qid} .
+      ?person ?namePredicate ?name .
+      VALUES ?namePredicate {{ rdfs:label skos:altLabel }}
+      FILTER (LANG(?name) IN ("zh", "zh-hans", "zh-hant", "zh-cn", "zh-tw"))
+      {restriction}
+    }} LIMIT {limit}"""
+
+
+def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path, *,
+                   query: str | None = None, cache_suffix: str = ''):
     cache.mkdir(parents=True,exist_ok=True)
-    prefix=f'P103_{lang}_{qid}_{max_rows}'
+    if cache_suffix and not re.fullmatch(r'[a-zA-Z0-9_-]{1,60}',cache_suffix):
+        raise ValueError('Invalid Wikidata cache suffix')
+    # Keep original P103 file names so previous successful downloads remain reusable.
+    prefix=f'P103_{lang}_{qid}_{max_rows}' + ('_'+cache_suffix if cache_suffix else '')
     json_path=cache/(prefix+'.json')
     csv_path=cache/(prefix+'.csv')
     for path,parser in ((json_path,_read_wikidata_payload),
@@ -283,7 +307,7 @@ def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path):
                 print(f'[wikidata] discard invalid cache: {path.name}',flush=True)
                 path.unlink(missing_ok=True)
 
-    query=_wd_query(qid,max_rows)
+    query=query if query is not None else _wd_query(qid,max_rows)
     last_error=None
     # Two JSON attempts, then switch serialization to CSV. Retries therefore
     # change the actual data representation, instead of repeating a broken JSON.
@@ -333,73 +357,128 @@ def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path):
 
 def language_records(cache: Path, gold: list[dict], max_rows: int, mode: str, seed: int,
                      min_per_language: int = 80):
-    """Build P103 proxy labels. Splits group Wikidata entity and same-surface aliases."""
-    if mode == 'off': return [],{'status':'disabled','warning':'Language task disabled'}
-    raw={}; errors={}; query_items={}
+    """Build the EXACT eight P103 language classes with documented enrichment.
+
+    First collect previous cached P103 primary data. For underrepresented classes,
+    add P103 Chinese-language labels plus aliases (including zh-hant).
+    Only if still below minimum, include separately marked P1412-only records,
+    whose subjects have *no* P103 value at all. Never label citizenship as language.
+    Quarantine cross-language homographs and group aliases before data splitting.
+    """
+    if mode == 'off': return [], {'status':'disabled','warning':'Language task disabled'}
+    raw={}; errors={}; query_items={}; supplementary={}; auxiliary={}; enrichment_errors={}
+    target=max(300,min_per_language*2)
+    unique_people=lambda records: len({ent for ent,_ in records})
     for lang,qids in WD.items():
-        qids = (qids,) if isinstance(qids, str) else tuple(qids)
-        query_items[lang] = list(qids)
-        merged=set()
+        qids=(qids,) if isinstance(qids,str) else tuple(qids)
+        query_items[lang]=list(qids)
+        merged=set(); native_extra=set(); auxiliary_extra=set()
         try:
             for qid in qids:
                 print(f'[wikidata] {lang} native-language proxy {qid}',flush=True)
                 merged.update(fetch_wikidata(lang,qid,max_rows,cache))
                 time.sleep(0.4)
-            raw[lang] = sorted(merged)
         except Exception as e:
             errors[lang]=str(e)
-            if mode == 'required': raise
-            raw[lang] = sorted(merged)
-    by_name=defaultdict(set); by_entity=defaultdict(set)
-    for lang,rows in raw.items():
-        for ent,name in rows:
-            by_name[name].add(lang)
-            by_entity[ent].add(lang)
-    # Eliminate ambiguity among source-language proxy labels, instead of making up a label.
+            if mode=='required': raise
+
+        # P103 remains the authoritative proxy source. Expand only underfilled
+        # languages so large Japanese/Korean/Chinese sets are not over-fetched.
+        if unique_people(merged)<target:
+            for qid in qids:
+                try:
+                    query=_wd_query_expanded(qid,max_rows,source_property='P103')
+                    extra=fetch_wikidata(lang,qid,max_rows,cache,query=query,
+                        cache_suffix='P103-han-alias-v2')
+                    native_extra.update(set(extra)-merged)
+                    merged.update(extra)
+                    print(f'[wikidata] {lang} P103 labels/aliases: {len(merged)} total',flush=True)
+                except Exception as e:
+                    enrichment_errors[f'{lang}/P103/{qid}']=str(e)
+                    print(f'[wikidata] {lang} P103 alias expansion skipped: {str(e)[:200]}',flush=True)
+        # Last resort. P1412 is multilingual ability, not a mother-tongue or
+        # etymology claim; require no P103 and retain explicit provenance.
+        if unique_people(merged)<min_per_language:
+            for qid in qids:
+                try:
+                    query=_wd_query_expanded(qid,max_rows,source_property='P1412')
+                    extra=fetch_wikidata(lang,qid,max_rows,cache,query=query,
+                        cache_suffix='P1412-no-P103-v2')
+                    auxiliary_extra.update(set(extra)-merged)
+                    merged.update(extra)
+                    print(f'[wikidata] {lang} P1412 auxiliary: +{len(extra)}, '
+                          f'{len(merged)} total',flush=True)
+                except Exception as e:
+                    enrichment_errors[f'{lang}/P1412/{qid}']=str(e)
+                    print(f'[wikidata] {lang} P1412 fallback unavailable: {str(e)[:200]}',flush=True)
+        raw[lang]=sorted(merged)
+        auxiliary[lang]=auxiliary_extra
+        supplementary[lang]={'P103_alias_added':len(native_extra),
+                             'P1412_only_added':len(auxiliary_extra),
+                             'raw_unique':len(merged),
+                             'unique_people':unique_people(merged)}
+
+    by_name=defaultdict(set);by_entity=defaultdict(set)
+    for lang,records in raw.items():
+        for ent,name in records:
+            by_name[name].add(lang);by_entity[ent].add(lang)
     known_gold_names={g['name'] for g in gold}
     records=[]
-    for lang,rows in raw.items():
-        for ent,name in rows:
+    for lang,items in raw.items():
+        for ent,name in items:
             if len(by_name[name])==1 and len(by_entity[ent])==1 and name not in known_gold_names:
                 records.append((ent,name,lang))
-    # Graph union: all aliases of the same person, and all people sharing a Han label.
+    records=sorted(set(records))
+    preliminary=Counter(lang for _,_,lang in records)
+    entity_counts={lang:len({ent for ent,name,code in records if code==lang}) for lang in WD}
+    eligible={lang for lang,n in entity_counts.items() if n>=min_per_language}
+    # Graph union: all people sharing a Han label and all aliases of a person
+    # remain in one deterministic split to prevent source-level leakage.
     parent={}
     def find(x):
         parent.setdefault(x,x)
-        if parent[x]!=x: parent[x]=find(parent[x])
+        if parent[x]!=x:parent[x]=find(parent[x])
         return parent[x]
     def union(a,b):
         a,b=find(a),find(b)
-        if a!=b: parent[b]=a
-    for ent,name,_ in records: union('Q:'+ent,'N:'+name)
-    # Names from multiple entities now in same split; remove exact duplicate rows.
-    records=sorted(set(records))
-    count=Counter(lang for _,_,lang in records)
-    eligible={lang for lang,n in count.items() if n>=min_per_language}
+        if a!=b:parent[b]=a
+    for ent,name,_ in records:union('Q:'+ent,'N:'+name)
     rows=[]
     for ent,name,lang in records:
-        if lang not in eligible: continue
+        if lang not in eligible:continue
         group=find('Q:'+ent)
+        is_aux=(ent,name) in auxiliary[lang]
         rows.append({'name':name,'label':lang,'split':split3('lang:'+group,seed),
-                     'group':group,'tier':'proxy','entity_id':ent})
-    # reviewer-provided origin language included only in matching reviewed split
+                     'group':group,'tier':'proxy_auxiliary' if is_aux else 'proxy',
+                     'source_property':'P1412' if is_aux else 'P103',
+                     'entity_id':ent})
     for g in gold:
         if g.get('lang') in WD and g['lang'] in eligible:
             rows.append({'name':g['name'],'label':g['lang'],'split':g['split'],
                          'group':'reviewed:'+g['group'],'tier':'gold',
+                         'source_property':'human-reviewed',
                          'entity_id':g['group']})
-    # Cross-split duplicate form from different entities is quarantined.
     name_splits=defaultdict(set)
-    for row in rows: name_splits[row['name']].add(row['split'])
+    for row in rows:name_splits[row['name']].add(row['split'])
     rows=[r for r in rows if len(name_splits[r['name']])==1]
+    final_count=Counter(r['label'] for r in rows if r.get('tier')!='gold')
+    final_people={lang:len({r['entity_id'] for r in rows
+                            if r['label']==lang and r.get('tier')!='gold'}) for lang in WD}
     expected=set(WD)
-    missing=sorted(expected-eligible)
-    status='ready' if not missing and not errors else ('partial' if eligible else 'insufficient')
-    return rows,{'status':status,'failed_languages':errors,'source_rows':dict(count),
-        'query_items':query_items,'expected_languages':sorted(expected),
-        'eligible_languages':sorted(eligible),'missing_languages':missing,
-        'final_rows':dict(Counter(r['label'] for r in rows)),
-        'proxy_semantics':'Wikidata P103 is person native language, not name etymology; no verified origin-language claims.',
+    missing=sorted(expected-{lang for lang,n in final_people.items()
+                             if n>=min_per_language})
+    status='ready' if not missing and not errors else ('partial' if rows else 'insufficient')
+    return rows,{'status':status,'failed_languages':errors,
+        'source_rows':dict(preliminary),'query_items':query_items,
+        'expected_languages':sorted(expected),'eligible_languages':sorted(eligible),
+        'missing_languages':missing,'final_rows':dict(Counter(r['label'] for r in rows)),
+        'unique_person_counts':final_people,
+        'supplementary':supplementary,'enrichment_errors':enrichment_errors,
+        'auxiliary_training_rows':dict(Counter(r['label'] for r in rows
+                                          if r['tier']=='proxy_auxiliary')),
+        'proxy_semantics':'P103=person native language; P1412=language proficiency, '
+                          'used only for people with no P103 and explicitly marked weaker; '
+                          'neither establishes personal-name etymology.',
         'zh_proxy_items':['Q7850 Chinese','Q9192 Mandarin','Q727694 Standard Chinese']}
 
 

@@ -124,7 +124,7 @@ class TrainerTests(unittest.TestCase):
         self.assertEqual(WD['zh'], ('Q7850','Q9192','Q727694'))
 
     def test_language_records_merge_chinese_qids_and_require_all_eight(self):
-        def fake_fetch(lang, qid, max_rows, cache):
+        def fake_fetch(lang, qid, max_rows, cache, **kwargs):
             if lang == 'zh':
                 idx = WD['zh'].index(qid)
                 start, count = idx * 40, 40
