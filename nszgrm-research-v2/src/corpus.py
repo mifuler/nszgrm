@@ -22,7 +22,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from strong_data import LABELS, LANGS, load_gold, norm_name, source_names
+from strong_data import normalize_names, LABELS, LANGS, load_gold, source_names
 
 REPO = 'https://github.com/wainshine/Chinese-Names-Corpus.git'
 FILES = {
@@ -152,8 +152,39 @@ def build_writing(root: Path, gold: list[dict], cap: int, seed: int):
     # Augment Chinese-native training pool with distinct historical names.
     names['zh_native'].update(names.pop('zh_ancient_extra'))
     overlap = set()
+    opencc_cross_label = []
     for i, a in enumerate(LABELS):
-        for b in LABELS[i+1:]: overlap |= names[a] & names[b]
+        for b in LABELS[i+1:]:
+            pair_overlap = names[a] & names[b]
+            overlap |= pair_overlap
+            converted_a = stats[a].get('_opencc_converted_targets', set())
+            converted_b = stats[b].get('_opencc_converted_targets', set())
+            for name in sorted(pair_overlap):
+                if name in converted_a or name in converted_b:
+                    opencc_cross_label.append({
+                        'simplified': name,
+                        'labels': [a, b],
+                        'source_forms': {
+                            a: stats[a].get('_opencc_source_forms', {}).get(name, [name]),
+                            b: stats[b].get('_opencc_source_forms', {}).get(name, [name]),
+                        },
+                    })
+    zh_native_targets = (stats['zh_native'].get('_opencc_converted_targets', set()) |
+                         stats['zh_ancient_extra'].get('_opencc_converted_targets', set()))
+    zh_native_forms = dict(stats['zh_native'].get('_opencc_source_forms', {}))
+    zh_native_forms.update(stats['zh_ancient_extra'].get('_opencc_source_forms', {}))
+    chinese_japanese = []
+    for name in sorted(names['zh_native'] & names['ja_kanji_proxy']):
+        if name in zh_native_targets or name in stats['ja_kanji_proxy'].get('_opencc_converted_targets', set()):
+            chinese_japanese.append({
+                'simplified': name,
+                'zh_native_sources': zh_native_forms.get(name, [name]),
+                'ja_kanji_proxy_sources': stats['ja_kanji_proxy'].get('_opencc_source_forms', {}).get(name, [name]),
+            })
+    # Internal sets/maps are used for collision auditing only; keep the report JSON-safe.
+    for source_stats in stats.values():
+        source_stats.pop('_opencc_converted_targets', None)
+        source_stats.pop('_opencc_source_forms', None)
     gold_names = {g['name'] for g in gold}
     out=[]; selected={}
     for i,label in enumerate(LABELS):
@@ -168,6 +199,11 @@ def build_writing(root: Path, gold: list[dict], cap: int, seed: int):
     for g in gold:
         out.append(dict(g))
     return out,{'source_counts':stats,'ambiguous_spellings_excluded':len(overlap),
+                'opencc_cross_label_collision_count':len(opencc_cross_label),
+                'opencc_cross_label_collision_examples':opencc_cross_label[:20],
+                'chinese_japanese_same_name_overlap_after_normalization_count':len(names['zh_native'] & names['ja_kanji_proxy']),
+                'opencc_chinese_japanese_collision_count':len(chinese_japanese),
+                'opencc_chinese_japanese_collision_examples':chinese_japanese[:20],
                 'gold_spellings_excluded':len(gold_names),'sample_counts':selected}
 
 
@@ -222,32 +258,30 @@ def _read_wikidata_csv(path: Path):
     reader=csv.DictReader(io.StringIO(raw,newline=''),strict=True)
     if not reader.fieldnames or not {'person','name'}.issubset(reader.fieldnames):
         raise ValueError('Wikidata CSV has unexpected headers')
-    result=set()
+    pending=[]
     for i,row in enumerate(reader):
         if None in row or row.get('person') is None or row.get('name') is None:
             raise ValueError(f'Wikidata CSV has malformed row {i+2}')
         person=row['person'].rsplit('/',1)[-1]
         if any(ord(ch)<32 for ch in row['name']):
             continue  # Reject control-bearing labels before strip()/NFKC.
-        name=norm_name(row['name'])
-        if name and re.fullmatch(r'Q[1-9]\d*',person):
-            result.add((person,name))
-    if not result:
-        raise ValueError('Wikidata CSV has no valid Han names; refusing to cache')
+        if re.fullmatch(r'Q[1-9]\d*',person):
+            pending.append((person,row['name']))
+    converted=normalize_names([name for _,name in pending])
+    result={(person,name) for (person,_),name in zip(pending,converted) if name}
     return sorted(result)
 
 
 def _wikidata_json_rows(raw):
-    result=set()
+    pending=[]
     for row in raw['results']['bindings']:
         if any(ord(ch)<32 for ch in row['name']['value']):
             continue  # strip() would otherwise hide leading/trailing controls.
-        name=norm_name(row['name']['value'])
         entity=row['person']['value'].rsplit('/',1)[-1]
-        if name and re.fullmatch(r'Q[1-9]\d*',entity):
-            result.add((entity,name))
-    return sorted(result)
-
+        if re.fullmatch(r'Q[1-9]\d*',entity):
+            pending.append((entity,row['name']['value']))
+    converted=normalize_names([name for _,name in pending])
+    return sorted({(entity,name) for (entity,_),name in zip(pending,converted) if name})
 
 def _aria2_download(url: str, dest: Path, headers: dict[str,str] | None = None):
     """Download with aria2 retry/reconnect handling; caller validates the payload."""

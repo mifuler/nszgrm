@@ -1,4 +1,4 @@
-# NSZGRM · 中文姓名多模型监督训练工程（v3.1）
+# NSZGRM · 中文姓名多模型监督训练工程（v3.3.1）
 
 本工程使用 Python 在 GitHub Actions 的 Ubuntu Linux CPU 环境训练中文姓名模型。它只负责**数据获取、监督训练、模型融合、评估和结果保存**；不生成 HTML，不包含浏览器前端。HTML 由独立项目开发，可按需读取 `models_fp32.json` 或 `models_int8.json`。
 
@@ -65,6 +65,13 @@
 同一任务中相同汉字姓名不会跨训练、验证和测试集；Wikidata 数据按人物实体及相同姓名连通分组。仍可能存在同一人物的其他译名、不同译名对应同一原名等跨样本关系，必须继续用人工审核数据检查。
 
 
+
+## 姓名统一与 OpenCC 简体化（v3.3.1）
+
+姓名文本先执行 Unicode NFKC，再通过 `opencc-js 1.4.2` 的 `jp → cn` 后接 `t → cn` 配置转换为简体中文。处理范围覆盖中文姓名语料、外文姓名音译语料、日本汉字姓名语料，以及 Wikidata 中文标签；姓名原有的书写类别和语言来源标签保持不变。含汉字的分组标识也执行同一转换。
+
+转换发生在去重、类别冲突过滤、实体分组和训练/验证/测试划分之前。繁简转换后完全相同的姓名会合并；若相同简体姓名跨越不同书写类别，则按原有冲突规则从弱标签集合中排除。训练输出中的 `REPORT.json` 会记录转换行数、转换后唯一姓名数、碰撞数量和最多 10 个碰撞示例。OpenCC 依赖由 `tools/install_opencc.py` 从指定的 npm 1.4.2 tarball 安装，并在训练前检查版本和转换结果。
+
 ## v3.3：中文姓名与已知误判强化
 
 继续使用 3 类书写模型及 8 类语言模型，不修改类别定义。`data/hard_cases.csv` 与 HTML 原先的 25 条精准修正规则完全对应（23 条音译、2 条中国本土）。正式训练先从弱标签集合中移除这 25 个字符串的所有记录，再将其按明确标签重复加入训练集；不会混入验证或测试。神经网络的每类抽样优先保留这些硬例，避免随机抽样把它们丢掉。
@@ -116,7 +123,7 @@ Wikidata 下载优先使用 aria2c，失败时由 urllib 继续重试。HTTP 截
 
 ```bash
 pkg update -y
-pkg install -y git gh rsync unzip
+pkg install -y git gh rsync unzip nodejs-lts p7zip
 termux-setup-storage
 
 gh api user --jq .login
@@ -125,11 +132,11 @@ gh repo view mifuler/nszgrm --json viewerPermission --jq '.viewerPermission'
 
 当前账号必须对 `mifuler/nszgrm` 具有 `WRITE`、`MAINTAIN` 或 `ADMIN` 权限，并允许修改 `.github/workflows`。
 
-把 ZIP 下载到 Android `Download`，执行：
+把 Release 中的 `NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z` 下载到 Android `Download`，执行：
 
 ```bash
 mkdir -p ~/nszgrm-v3
-unzip -o ~/storage/downloads/NSZGRM-ResearchTrainer-v3-zh8-no-html.zip -d ~/nszgrm-v3
+7z x ~/storage/downloads/NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z -o~/nszgrm-v3 -y
 
 cd ~/nszgrm-v3/NSZGRM-ResearchTrainer
 bash push-existing.sh mifuler/nszgrm
@@ -160,7 +167,7 @@ bash push-existing.sh mifuler/nszgrm
 
 ## 输出内容
 
-训练成功后，Actions Artifact 和 GitHub Release ZIP 仅包含训练结果，例如：
+训练成功后，GitHub Release 会提供两个 LZMA2 `-mx=9` 极限压缩的 7z：训练源码包 `NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z`，以及包含 FP32、量化模型和报告的 `nszgrm-models-<run_id>.7z`。Actions Artifact 保留原有输出目录，例如：
 
 ```text
 outputs/
@@ -191,7 +198,7 @@ outputs/
 - `*_disagreement_review_queue.csv`：模型意见分歧较大或融合置信度较低的待人工审核姓名。
 - `review_queue.csv`：书写语料抽样审核队列。
 
-Artifact 默认保留 30 天；开启 `publish_release` 后，工作流会发布非 latest 的 `research-v3-<run_id>` Release。
+Artifact 默认保留 30 天；开启 `publish_release` 后，工作流会发布非 latest 的 `research-v3-<run_id>` Release。两个 Release 资产均使用 LZMA2、`-mx=9`、273 字节字典匹配、256 MB 字典和固实压缩，并通过 `7z t` 校验。
 
 ## 本地测试与运行
 
@@ -203,6 +210,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m pip install 'torch==2.6.0+cpu' --index-url https://download.pytorch.org/whl/cpu
 
+python tools/install_opencc.py
 python -m compileall -q src tests
 python -m unittest discover -s tests -v
 
@@ -234,6 +242,13 @@ python tests/verify_outputs.py outputs --require-language
 ```
 
 本地命令展示首轮量化和验收；如果某个模型损耗超过 10%，需要根据 LOSS_REPORT.json 将该模型加入 INT16 回退名单并重新量化。GitHub Actions 已自动执行选择性回退和复测。
+
+
+### Demo 模型压缩包自动替换
+
+Demo 仓库 `iqonli/nszgrm-demo` 保留 `model/2model-2026-11-17.7z` 原路径。新版 `package-models.yml` 每 15 分钟检查一次 `mifuler/nszgrm` 的新研究 Release，只有找到 `nszgrm-models-<run_id>.7z`（训练、量化和输出校验完成后发布）才下载，逐项校验 FP32/INT8 JSON 体积与八语言/书写模型结构，再使用与原 Demo 一致的 LZMA2 极限参数重新打成一个 7z，并提交同路径替换。未发现新 Release、训练失败或文件校验失败均不覆盖当前存档；同时保留手动触发入口。这个同步工作流位于随实验包交付的独立 `NSZGRM-Demo-package-models-auto-sync.yml` 文件，部署到 Demo 仓库 `.github/workflows/package-models.yml` 后生效。
+
+GitHub Actions 定时任务可能排队，实际同步有一定延迟，源 Release 发布后也可直接手动触发 Demo 的 `Package two NSZGRM models` 工作流。
 
 ## 当前研究限制
 

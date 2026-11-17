@@ -23,6 +23,7 @@ from sklearn.naive_bayes import ComplementNB
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, f1_score, log_loss, confusion_matrix
 from architectures import train_neural, probabilities
 from corpus import acquire, build_writing, checks, language_records, write_review_queue
+from opencc_bridge import OPENCC_JS_VERSION, OPENCC_TARBALL_URL
 from strong_data import LANGS, load_gold
 from hard_cases import load_hard_cases, load_chinese_names, add_writing_hard_cases, add_zh_language_support
 
@@ -341,17 +342,26 @@ def run(args):
             lg,zhmeta=add_zh_language_support(lg,source,hard,curated_zh,gold,
                           seed=args.seed,cap=args.zh_augment,hard_repeat=args.zh_hard_repeats)
             lmeta['zh_training_support']=zhmeta
-    bundle={'format_version':3,'trainer_version':'3.3.0','generated_utc':datetime.now(timezone.utc).isoformat(),
+    bundle={'format_version':3,'trainer_version':'3.3.1','generated_utc':datetime.now(timezone.utc).isoformat(),
             'seed':args.seed,'precision':'original-FP32; NO parameter quantization',
             'models':{},'provenance':{'writing':'corpus-membership WEAK supervision',
                                    'language':'8-class Wikidata P103 person native-language PROXY: zh/en/fr/de/es/ru/ja/ko'}}
-    report={'trainer_version':'3.3.0','generated_utc':bundle['generated_utc'],'training_mode':'DEMO_ONLY' if args.smoke else 'PUBLIC_WEAK_SUPERVISION',
+    report={'trainer_version':'3.3.1','generated_utc':bundle['generated_utc'],'training_mode':'DEMO_ONLY' if args.smoke else 'PUBLIC_WEAK_SUPERVISION',
             'hardware_note':'CPU compatible; parameters are from-scratch small architectures, not pretrained transformers',
             'data_sources':{'writing':wmeta,'language':lmeta,'upstream':provenance},
             'task_reports':{},'gold_test':'NO VERIFIED GOLD TEST; external generalization unproven',
-            'language_classes_expected':sorted(LANGS)}
+            'language_classes_expected':sorted(LANGS),
+            'normalization':{
+                'unicode':'NFKC',
+                'opencc_js_version':OPENCC_JS_VERSION,
+                'opencc_tarball':OPENCC_TARBALL_URL,
+                'conversion_chain':[{'from':'jp','to':'cn'},{'from':'t','to':'cn'}],
+                'scope':'all accepted Han-only name fields from Chinese, foreign-phonetic, Japanese-kanji and Wikidata corpora; Han-containing group IDs are normalized too',
+                'order':'before deduplication, cross-label conflict filtering, grouping and train/validation/test splitting',
+                'collision_handling':'normalized identical names are deduplicated within a class and excluded across conflicting writing classes'
+            }}
     with (args.output/'train_manifest.json').open('w',encoding='utf8') as f:
-        json.dump(report['data_sources'],f,ensure_ascii=False,indent=2,default=encode_numpy)
+        json.dump({'normalization':report['normalization'],'data_sources':report['data_sources']},f,ensure_ascii=False,indent=2,default=encode_numpy)
     wr_report={}; gold_write=[]
     bundle['models']['writing'],wr_report,gold_write=train_task('writing',wr,args.output,args)
     report['task_reports']['writing']=wr_report
@@ -413,6 +423,10 @@ def run(args):
            f'原精度模型总大小：{bytes_models:,} / {BYTE_CAP:,} 字节',
            '模型参数均为 FP32，未量化；所有分类器独立评分并经验证集融合。',
            '本训练工程只导出模型 JSON、数据清单、评估报告和人工复核队列，不生成 HTML。','']
+    writing_data = report['data_sources'].get('writing', {})
+    lines.append('姓名归一化：OpenCC JS ' + OPENCC_JS_VERSION + '（jp→cn、t→cn，两阶段统一简体）')
+    lines.append('转换后中日书写姓名同名碰撞：' + str(writing_data.get('opencc_chinese_japanese_collision_count', 0)) + '（已按跨类别冲突规则排除）')
+    lines.append('')
     for task,tr in report['task_reports'].items():
         lines.append(f'## {task}')
         if 'weak_test_metrics' not in tr:

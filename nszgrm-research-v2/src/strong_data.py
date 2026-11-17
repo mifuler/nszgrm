@@ -17,15 +17,35 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from opencc_bridge import OPENCC_JS_VERSION, convert_many as opencc_convert_many
+
 LABELS = ('zh_native', 'foreign_phonetic_proxy', 'ja_kanji_proxy')
 LANGS = ('zh', 'en', 'ru', 'ja', 'fr', 'es', 'de', 'ko')
 HAN = re.compile(r'^[\u3400-\u9fff]{2,8}$')
+HAN_ANY = re.compile(r'[\u3400-\u9fff]')
 GOLD_COLUMNS = ('name', 'writing_type', 'origin_lang', 'group_id', 'reference_url', 'reviewer', 'split')
 
 
+def normalize_names(values) -> list[str]:
+    """NFKC-normalize and convert every Han-only name to Simplified Chinese.
+
+    OpenCC runs before deduplication, label-conflict checks and data splitting.
+    Japanese kanji names pass through jp2cn and t2s converters while retaining
+    their original corpus label.
+    """
+    prepared = [unicodedata.normalize('NFKC', str(value or '')).strip() for value in values]
+    # Run OpenCC on every text field containing Han, including mixed-script
+    # candidates; retain the original accepted-name filter afterwards.
+    eligible = [i for i, value in enumerate(prepared) if HAN_ANY.search(value)]
+    converted = opencc_convert_many([prepared[i] for i in eligible])
+    output = [''] * len(prepared)
+    for index, value in zip(eligible, converted):
+        output[index] = value if HAN.fullmatch(value) else ''
+    return output
+
+
 def norm_name(text: str) -> str:
-    s = unicodedata.normalize('NFKC', text).strip()
-    return s if HAN.fullmatch(s) else ''
+    return normalize_names([text])[0]
 
 
 def hash_partition(group: str, seed: int, valid_fraction: float = 0.1) -> str:
@@ -34,21 +54,57 @@ def hash_partition(group: str, seed: int, valid_fraction: float = 0.1) -> str:
 
 
 def group_norm(s: str) -> str:
-    return unicodedata.normalize('NFKC', s).strip().lower()
+    value = unicodedata.normalize('NFKC', str(s or '')).strip()
+    if HAN_ANY.search(value):
+        value = opencc_convert_many([value])[0]
+    return value.lower()
 
 
 def source_names(path: Path):
-    # Downloaded main corpus contains name strings, sometimes followed by tabs/columns.
-    names = set()
+    # Convert unique raw spellings in batches, before deduplication and label overlap checks.
+    raw_counts = Counter()
     counted = 0
     with path.open(encoding='utf-8-sig', errors='replace') as f:
         for raw in f:
             counted += 1
             first = re.split(r'[\t,，|\s]', raw.strip(), maxsplit=1)[0]
-            name = norm_name(first)
-            if name:
-                names.add(name)
-    return names, {'lines': counted, 'unique_valid': len(names)}
+            value = unicodedata.normalize('NFKC', first).strip()
+            if HAN_ANY.search(value):
+                raw_counts[value] += 1
+
+    raw_names = list(raw_counts)
+    simplified_names = normalize_names(raw_names)
+    names = set()
+    sources_by_result = defaultdict(set)
+    converted_rows = 0
+    converted_results = set()
+    for raw_name, simplified in zip(raw_names, simplified_names):
+        if not simplified:
+            continue
+        names.add(simplified)
+        sources_by_result[simplified].add(raw_name)
+        if simplified != raw_name:
+            converted_rows += raw_counts[raw_name]
+            converted_results.add(simplified)
+
+    collisions = [
+        {'simplified': result, 'sources': sorted(sources)}
+        for result, sources in sources_by_result.items() if len(sources) > 1
+    ]
+    collisions.sort(key=lambda item: item['simplified'])
+    return names, {
+        'lines': counted,
+        'unique_raw_valid': sum(bool(HAN.fullmatch(raw)) for raw in raw_names),
+        'unique_valid': len(names),
+        'opencc_js_version': OPENCC_JS_VERSION,
+        'opencc_converted_rows': converted_rows,
+        'opencc_converted_unique_names': len(converted_results),
+        'simplified_name_collisions': len(collisions),
+        'simplified_name_collision_examples': collisions[:10],
+        '_opencc_converted_targets': converted_results,
+        '_opencc_source_forms': {result: sorted(sources) for result, sources in sources_by_result.items()
+                                 if any(source != result for source in sources)},
+    }
 
 
 def load_gold(path: Path):
@@ -114,6 +170,25 @@ def build_weak(source_dir: Path, gold_rows: list[dict], max_per_class: int, seed
     overlaps = (all_names[LABELS[0]] & all_names[LABELS[1]]) | \
                (all_names[LABELS[0]] & all_names[LABELS[2]]) | \
                (all_names[LABELS[1]] & all_names[LABELS[2]])
+    opencc_cross_label = []
+    for i, left in enumerate(LABELS):
+        for right in LABELS[i+1:]:
+            for name in sorted(all_names[left] & all_names[right]):
+                if (name in raw_info[left].get('_opencc_converted_targets', set()) or
+                        name in raw_info[right].get('_opencc_converted_targets', set())):
+                    opencc_cross_label.append({
+                        'simplified': name,
+                        'labels': [left, right],
+                        'source_forms': {
+                            left: raw_info[left].get('_opencc_source_forms', {}).get(name, [name]),
+                            right: raw_info[right].get('_opencc_source_forms', {}).get(name, [name]),
+                        },
+                    })
+    zh_ja_collisions = [item for item in opencc_cross_label
+                        if item['labels'] == ['zh_native', 'ja_kanji_proxy']]
+    for source_stats in raw_info.values():
+        source_stats.pop('_opencc_converted_targets', None)
+        source_stats.pop('_opencc_source_forms', None)
     gold_names = {r['name'] for r in gold_rows}
     by_label = {}
     for i, label in enumerate(LABELS):
@@ -128,6 +203,11 @@ def build_weak(source_dir: Path, gold_rows: list[dict], max_per_class: int, seed
                          'split': hash_partition(name, seed), 'tier': 'weak',
                          'lang': '', 'url': '', 'reviewer': ''})
     return rows, {'source_counts': raw_info, 'cross_label_spellings_excluded': len(overlaps),
+                  'opencc_cross_label_collision_count': len(opencc_cross_label),
+                  'opencc_cross_label_collision_examples': opencc_cross_label[:20],
+                  'chinese_japanese_same_name_overlap_after_normalization_count': len(all_names['zh_native'] & all_names['ja_kanji_proxy']),
+                  'opencc_chinese_japanese_collision_count': len(zh_ja_collisions),
+                  'opencc_chinese_japanese_collision_examples': zh_ja_collisions[:20],
                   'gold_spellings_excluded': len(gold_names),
                   'weak_selected': {x: len(by_label[x]) for x in LABELS}}
 

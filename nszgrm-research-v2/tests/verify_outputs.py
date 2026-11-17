@@ -43,7 +43,7 @@ def main():
     if fp_path.stat().st_size>FP32_CAP:raise SystemExit('FP32 model exceeds 200 MB')
     fp=json.loads(fp_path.read_text('utf8'))
     report=json.loads((out/'REPORT.json').read_text('utf8'))
-    if fp.get('format_version')!=3 or fp.get('trainer_version')!='3.3.0':
+    if fp.get('format_version')!=3 or fp.get('trainer_version')!='3.3.1':
         raise SystemExit('unexpected FP32 model format/trainer version')
     if not args.allow_demo and report.get('training_mode')!='PUBLIC_WEAK_SUPERVISION':
         raise SystemExit('formal run must be PUBLIC_WEAK_SUPERVISION')

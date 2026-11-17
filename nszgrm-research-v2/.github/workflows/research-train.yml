@@ -1,0 +1,268 @@
+name: NSZGRM v3.3 (3 writing + 8 languages; FP32 and <15 MB quantized)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nszgrm-research-v2/trigger-quantized-run-20261117.txt'
+      - 'nszgrm-research-v2/src/**'
+      - 'nszgrm-research-v2/tests/**'
+      - 'nszgrm-research-v2/tools/**'
+      - 'nszgrm-research-v2/data/hard_cases.csv'
+      - 'nszgrm-research-v2/data/chinese_hard_examples.txt'
+      - '.github/workflows/research-train.yml'
+  workflow_dispatch:
+    inputs:
+      max_per_class:
+        description: '写法分类：每类最多使用多少条弱标签姓名，0=不限量'
+        type: choice
+        required: true
+        default: '150000'
+        options: ['60000', '150000', '250000', '0']
+      neural_per_class:
+        description: 'TextCNN / BiGRU：每类最大训练量（按类别抽样）'
+        type: choice
+        required: true
+        default: '45000'
+        options: ['15000', '45000', '80000']
+      epochs:
+        description: '神经网络训练轮数上限；早停可能提前结束'
+        type: choice
+        required: true
+        default: '10'
+        options: ['5', '10', '15']
+      wikidata:
+        description: '八语言模型：required 强制八类齐全；best_effort 允许缺失并跳过语言模型；off 关闭'
+        type: choice
+        required: true
+        default: required
+        options: [required, best_effort, 'off']
+      publish_release:
+        description: '训练结束时发布 FP32、量化模型和研究报告（不包含 HTML）'
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: nszgrm-research-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    name: Supervised training + validation (Linux CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: write  # Append validated Wikidata responses to the dedicated cache Release.
+    defaults:
+      run:
+        working-directory: nszgrm-research-v2
+    env:
+      PYTHONUNBUFFERED: '1'
+      OPENBLAS_NUM_THREADS: '2'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      PYTORCH_ENABLE_MPS_FALLBACK: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install aria2 downloader
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+          aria2c --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: nszgrm-research-v2/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install and verify OpenCC JS 1.4.2
+        run: python tools/install_opencc.py
+      - name: Install numerical packages and CPU-only PyTorch
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install 'torch==2.6.0+cpu' --index-url https://download.pytorch.org/whl/cpu
+      - name: Static checks and deterministic offline unit tests
+        run: |
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+      - name: End-to-end smoke training (synthetic; never a performance claim)
+        run: |
+          python src/train_all.py --smoke --output smoke-artifacts \
+            --epochs 1 --neural-per-class 30 --max-features 600 \
+            --vocab-limit 150 --embedding-dim 16 --cnn-channels 16 \
+            --gru-hidden 16 --batch-size 128
+          python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language --skip-quantized
+      - name: Restore verified Wikidata language cache
+        uses: actions/cache/restore@v4
+        with:
+          path: nszgrm-research-v2/.cache/nszgrm/wikidata/
+          key: nszgrm-wikidata-v3.1.1-${{ github.run_id }}
+          restore-keys: |
+            nszgrm-wikidata-v3.1.1-
+      - name: Restore persistent verified Wikidata snapshot from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python src/release_dataset_cache.py restore \
+            --root .cache/nszgrm/wikidata --tag nszgrm-wikidata-cache-v2
+      - name: Acquire public corpora; train models; evaluate held-out data
+        run: |
+          rm -f .cache/quant_eval_samples.json
+          python src/train_all.py \
+            --output outputs --cache .cache/nszgrm \
+            --max-per-class '${{ inputs.max_per_class || '150000' }}' \
+            --neural-per-class '${{ inputs.neural_per_class || '45000' }}' \
+            --epochs '${{ inputs.epochs || '10' }}' \
+            --wikidata '${{ inputs.wikidata || 'required' }}' \
+            --wikidata-limit 5000 --min-language 80 \
+            --zh-augment 8000 --hard-repeats 48 --zh-hard-repeats 12 \
+            --max-features 60000 --vocab-limit 6000 \
+            --embedding-dim 128 --cnn-channels 96 --gru-hidden 128 \
+            --batch-size 256 --seed 20261117
+      - name: Export initial per-row INT8 model (selective INT16 safety fallback)
+        run: |
+          python src/quantize_existing.py --source outputs/models_fp32.json --out outputs \
+            --int16-models language/linear
+      - name: Evaluate quantized model against the training held-out split
+        run: |
+          set -euo pipefail
+          if node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+              .cache/quant_eval_samples.json outputs/LOSS_REPORT.json; then
+            echo 'Initial INT8/INT16 bundle passed the <=10% relative Accuracy and Macro-F1 gate.'
+          else
+            FALLBACK=$(python - <<'PY'
+          import json
+          data=json.load(open('outputs/LOSS_REPORT.json',encoding='utf-8'))
+          fallback={'language/linear'}
+          for task,result in data['tasks'].items():
+              for model,item in result.get('models',{}).items():
+                  if model!='fusion' and not item.get('passed',False):
+                      fallback.add(task+'/'+model)
+              if result.get('models',{}).get('fusion',{}).get('passed') is False:
+                  fallback.update(task+'/'+m for m in ('linear','complement_nb','cnn','bigru'))
+          print(','.join(sorted(fallback)))
+          PY
+            )
+            echo "Retry with selective INT16 fallback: $FALLBACK"
+            python src/quantize_existing.py --source outputs/models_fp32.json --out outputs \
+              --int16-models "$FALLBACK"
+            if ! node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+                .cache/quant_eval_samples.json outputs/LOSS_REPORT.json; then
+              ALL_MODELS=$(python - <<'PY'
+          import json
+          d=json.load(open('outputs/models_fp32.json',encoding='utf-8'))
+          print(','.join(sorted(task+'/'+name for task,block in d['models'].items() for name in block['models'])))
+          PY
+              )
+              echo 'Selective fallback still exceeds the threshold; retrying all weight matrices as INT16.'
+              python src/quantize_existing.py --source outputs/models_fp32.json --out outputs \
+                --int16-models "$ALL_MODELS"
+              node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+                .cache/quant_eval_samples.json outputs/LOSS_REPORT.json
+            fi
+          fi
+          python src/record_quant_report.py outputs
+      - name: Verify FP32 and quantized model bundle, class coverage and size budgets
+        run: |
+          if [ '${{ inputs.wikidata || 'required' }}' = 'required' ]; then
+            python tests/verify_outputs.py outputs --require-language
+          else
+            python tests/verify_outputs.py outputs
+          fi
+      - name: Save validated Wikidata language cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: nszgrm-research-v2/.cache/nszgrm/wikidata/
+          key: nszgrm-wikidata-v3.1.1-${{ github.run_id }}
+      - name: Publish verified Wikidata responses to persistent Release (even on training failure)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python src/release_dataset_cache.py publish \
+            --root .cache/nszgrm/wikidata --tag nszgrm-wikidata-cache-v2
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f outputs/REPORT.md ]; then
+            cat outputs/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '训练未正常完成：请检查失败步骤和标准错误日志。' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload training outputs even when a later audit fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nszgrm-research-${{ github.run_id }}
+          path: nszgrm-research-v2/outputs/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+  release:
+    name: Publish audited FP32 + quantized models and reports (no HTML)
+    needs: train
+    if: ${{ github.event_name == 'push' || inputs.publish_release == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nszgrm-research-${{ github.run_id }}
+          path: outputs
+      - name: Package source and model outputs with maximum 7z compression
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -s outputs/REPORT.md
+          test -s outputs/REPORT.json
+          test -s outputs/models_fp32.json
+          test -s outputs/models_int8.json
+          test -s outputs/LOSS_REPORT.json
+          test -s outputs/QUANT_AUDIT.json
+          test -s outputs/train_manifest.json
+          ! find outputs -type f -iname '*.html' | grep -q .
+          python - <<'PY'
+          from pathlib import Path
+          assert Path('outputs/models_fp32.json').stat().st_size <= 200_000_000
+          assert Path('outputs/models_int8.json').stat().st_size < 15_000_000
+          PY
+          if ! command -v 7z >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y p7zip-full
+          fi
+          7z a -t7z -m0=lzma2 -mx=9 -mfb=273 -md=256m -ms=on -mmt=on \
+            "nszgrm-models-${GITHUB_RUN_ID}.7z" outputs
+          7z t "nszgrm-models-${GITHUB_RUN_ID}.7z"
+          mkdir -p "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer"
+          cp -a nszgrm-research-v2/. "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/"
+          mkdir -p "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/.github/workflows"
+          cp .github/workflows/research-train.yml \
+            "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/.github/workflows/research-train.yml"
+          rm -f "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/MANIFEST.sha256"
+          (cd "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer" && \
+            find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
+          (cd "$RUNNER_TEMP/package" && \
+            7z a -t7z -m0=lzma2 -mx=9 -mfb=273 -md=256m -ms=on -mmt=on \
+              "$GITHUB_WORKSPACE/NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z" \
+              NSZGRM-ResearchTrainer)
+          7z t NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z
+          gh release create "research-v3-${GITHUB_RUN_ID}" \
+            "nszgrm-models-${GITHUB_RUN_ID}.7z" \
+            "NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z" \
+            --title "NSZGRM 3类书写 + 8类语言 FP32/量化模型 · Run ${GITHUB_RUN_ID}" \
+            --notes-file outputs/REPORT.md --latest=false

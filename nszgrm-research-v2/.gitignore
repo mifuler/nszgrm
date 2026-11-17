@@ -11,3 +11,4 @@ gold-smoke/
 *.aria2
 quant_out/
 source/
+vendor/opencc/
