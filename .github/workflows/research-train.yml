@@ -1,4 +1,4 @@
-name: NSZGRM v3.2 (3 writing + 8 languages; FP32 and <15 MB quantized)
+name: NSZGRM v3.3 (3 writing + 8 languages; FP32 and <15 MB quantized)
 
 on:
   push:
@@ -6,6 +6,8 @@ on:
     paths:
       - 'nszgrm-research-v2/trigger-quantized-run-20261117.txt'
       - 'nszgrm-research-v2/src/**'
+      - 'nszgrm-research-v2/data/hard_cases.csv'
+      - 'nszgrm-research-v2/data/chinese_hard_examples.txt'
       - '.github/workflows/research-train.yml'
   workflow_dispatch:
     inputs:
@@ -113,6 +115,7 @@ jobs:
             --epochs '${{ inputs.epochs || '10' }}' \
             --wikidata '${{ inputs.wikidata || 'required' }}' \
             --wikidata-limit 5000 --min-language 80 \
+            --zh-augment 8000 --hard-repeats 48 --zh-hard-repeats 12 \
             --max-features 60000 --vocab-limit 6000 \
             --embedding-dim 128 --cnn-channels 96 --gru-hidden 128 \
             --batch-size 256 --seed 20261117

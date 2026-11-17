@@ -27,7 +27,7 @@ from corpus import _read_wikidata_payload, _read_wikidata_csv, _wikidata_json_ro
 CACHE_SCHEMA = 2
 TAG = 'nszgrm-wikidata-cache-v2'
 ASSET = 'nszgrm-wikidata-verified-v2.tar.gz'
-NAME = re.compile(r'^P103_[a-z]{2}_[A-Za-z0-9_-]+_\d+(?:_[A-Za-z0-9_-]+)?\.(?:json|csv)$')
+NAME = re.compile(r'^P(?:103|1412)_[a-z]{2}_[A-Za-z0-9_-]+_\d+(?:_[A-Za-z0-9_-]+)?\.(?:json|csv)$')
 MAX_EACH = 25_000_000
 MAX_TOTAL = 200_000_000
 

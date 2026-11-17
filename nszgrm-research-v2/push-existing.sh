@@ -29,6 +29,6 @@ git add nszgrm-research-v2 .github/workflows/research-train.yml
 if git diff --cached --quiet; then echo '代码已是最新，不需要再次提交。'; exit 0; fi
 git -c user.name="$(gh api user --jq .login)" \
     -c user.email="$(gh api user --jq '.id')+$(gh api user --jq .login)@users.noreply.github.com" \
-    commit -m 'Expand eight-language samples; persist verified Wikidata data to cache Release'
+    commit -m 'Reinforce Chinese and known transliteration cases with leakage-safe training'
 git push origin "HEAD:$BRANCH"
 echo '已提交：https://github.com/'"$REPO"'/actions/workflows/research-train.yml'

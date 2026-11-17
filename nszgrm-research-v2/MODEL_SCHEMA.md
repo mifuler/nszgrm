@@ -7,7 +7,7 @@
 ```json
 {
   "format_version": 3,
-  "trainer_version": "3.0.0",
+  "trainer_version": "3.3.0",
   "generated_utc": "ISO-8601 UTC 时间",
   "seed": 20261117,
   "precision": "original-FP32; NO parameter quantization",
@@ -128,3 +128,11 @@ TF-IDF 的 vocabulary、idf、偏置、温度和融合权重保留原结构与 F
 ### v3.2 数据来源补充
 
 模型的 8 个语言类别未改变。训练报告 `data_sources.language.supplementary` 记录 P103 中文别名增加数量与 P1412 后备数量；`auxiliary_training_rows` 表示缺少 P103 母语证据的人物使用 P1412 进行语言能力弱监督的样本数。此信息不改变类别顺序或模型推理公式。
+
+### v3.3 中文姓名强化与硬例审计
+
+书写模型继续为 3 类，语言模型继续为 8 类；新增语言或合并语言只发生在独立 HTML 的显示层，不会改变模型中的 `classes` 或原始评分表。
+
+`models_fp32.json` 和后处理的 `models_int8.json` 均增加顶层 `hard_case_training_audit`，表示 25 条规则对应姓名在训练集内的检查结果。此数值只证明模型对已训练样本的识别情况，不能视为独立泛化准确率。
+
+Release 中另含 `HARD_CASE_AUDIT.json`（每例姓名、目标分类、预测分类及分数）。验证集、原有弱标签测试集及量化验收集均不会加入硬例重采样。语言模型额外抽样 8000 个不与日本/译名及任何现有测试样本重名的中国姓名，只进入训练集，另在报告中记录 `language.zh_vs_ja`。

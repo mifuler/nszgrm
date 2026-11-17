@@ -24,6 +24,7 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, classificat
 from architectures import train_neural, probabilities
 from corpus import acquire, build_writing, checks, language_records, write_review_queue
 from strong_data import LANGS, load_gold
+from hard_cases import load_hard_cases, load_chinese_names, add_writing_hard_cases, add_zh_language_support
 
 def encode_numpy(x):
     if isinstance(x,np.generic):return x.item()
@@ -100,7 +101,7 @@ def choose_weights(calibrated,y):
     return w.tolist()
 
 
-def model_bundle_linear(train,val,test,classes,max_features,seed,gold_test=None):
+def model_bundle_linear(train,val,test,classes,max_features,seed,gold_test=None,hard_cases=None):
     train_names=[r['name'] for r in train]
     y=np.array([classes.index(r['label']) for r in train],dtype=np.int64)
     vectorizer=TfidfVectorizer(analyzer='char',ngram_range=(1,3),lowercase=False,
@@ -126,13 +127,16 @@ def model_bundle_linear(train,val,test,classes,max_features,seed,gold_test=None)
         'complement_nb':{'arch':'complement_nb','classes':classes,'tfidf':common,
                          'feature_log_prob':nb.feature_log_prob_.astype(np.float32).tolist()}}
     x_gold=vectorizer.transform([r['name'] for r in gold_test]) if gold_test else None
+    x_hard=vectorizer.transform([r['name'] for r in hard_cases]) if hard_cases else None
     predictions={
         'linear':{'val':linear.predict_proba(x_val).astype(np.float64),
                   'test':linear.predict_proba(x_test).astype(np.float64),
-                  'gold':linear.predict_proba(x_gold).astype(np.float64) if x_gold is not None else np.empty((0,len(classes)))},
+                  'gold':linear.predict_proba(x_gold).astype(np.float64) if x_gold is not None else np.empty((0,len(classes))),
+                  'hard':linear.predict_proba(x_hard).astype(np.float64) if x_hard is not None else np.empty((0,len(classes)))},
         'complement_nb':{'val':nb.predict_proba(x_val).astype(np.float64),
                          'test':nb.predict_proba(x_test).astype(np.float64),
-                         'gold':nb.predict_proba(x_gold).astype(np.float64) if x_gold is not None else np.empty((0,len(classes)))}}
+                         'gold':nb.predict_proba(x_gold).astype(np.float64) if x_gold is not None else np.empty((0,len(classes))),
+                         'hard':nb.predict_proba(x_hard).astype(np.float64) if x_hard is not None else np.empty((0,len(classes)))}}
     return export,predictions,{'vocabulary_count':len(vectorizer.vocabulary_),
                                'train_samples':len(train_names)}
 
@@ -182,7 +186,9 @@ def train_task(task,rows,out,args):
     test_y=np.array([classes.index(r['label']) for r in test])
     # Gold test is never fit or calibrated; prediction is held out from training.
     gold_test=[r for r in rows if r.get('tier')=='gold' and r['split']=='test' and r['label'] in classes]
-    simple,probs,info=model_bundle_linear(train,val_all,test,classes,args.max_features,args.seed,gold_test)
+    hard_cases=sorted((r for r in rows if r.get('tier')=='hard_case'),key=lambda r:r['name'])
+    hard_cases=list({r['name']:r for r in hard_cases}.values())
+    simple,probs,info=model_bundle_linear(train,val_all,test,classes,args.max_features,args.seed,gold_test,hard_cases)
     exports=dict(simple)
     metrics={}; neural_info={}
     for arch in ('cnn','bigru'):
@@ -193,7 +199,8 @@ def train_task(task,rows,out,args):
         exports[arch]=exp;neural_info[arch]=detail
         probs[arch]={'val':probabilities(net,[r['name'] for r in val_all],vocab),
                      'test':probabilities(net,[r['name'] for r in test],vocab),
-                     'gold':probabilities(net,[r['name'] for r in gold_test],vocab)}
+                     'gold':probabilities(net,[r['name'] for r in gold_test],vocab),
+                     'hard':probabilities(net,[r['name'] for r in hard_cases],vocab)}
         del net
     temp={}
     for name in MODEL_NAMES:
@@ -212,6 +219,31 @@ def train_task(task,rows,out,args):
                        'validation_blend_macro_f1':evaluate(blend_y,sum(w[i]*p for i,p in enumerate(calibrated)),classes)['macro_f1'],
                        'strategy':'nonnegative 4-model stacking, min weight 0.03, optimized on validation-B only'}
     print(f'[fusion] {task}: test Macro-F1={metrics["fusion"]["test"]["macro_f1"]:.4f}',flush=True)
+    hard_audit={'n':len(hard_cases),'correct':0,'all_correct':False,'rows':[],
+                'evaluation_type':'training-set memorization check; NOT held-out generalization'}
+    if hard_cases:
+        probs_hard=sum(w[i]*temperature(probs[key]['hard'],temp[key])
+                       for i,key in enumerate(MODEL_NAMES))
+        for idx,row in enumerate(hard_cases):
+            pred=classes[int(probs_hard[idx].argmax())]
+            expected=row['label']
+            success=(pred==expected)
+            hard_audit['correct']+=int(success)
+            hard_audit['rows'].append({'name':row['name'],'expected':expected,
+                                       'predicted':pred,'correct':success,
+                                       'confidence':round(float(probs_hard[idx].max()),6)})
+        hard_audit['all_correct']=hard_audit['correct']==hard_audit['n']
+        print(f'[hard-cases] writing training examples recognized: '
+              f'{hard_audit["correct"]}/{hard_audit["n"]}',flush=True)
+    zh_ja_confusion={}
+    if task=='language' and 'zh' in classes and 'ja' in classes:
+        true_zh=(test_y==classes.index('zh'))
+        predicted_ja=(ensemble.argmax(axis=1)==classes.index('ja'))
+        count=int(true_zh.sum())
+        false=int((true_zh&predicted_ja).sum())
+        zh_ja_confusion={'zh_test_count':count,'zh_misclassified_as_ja':false,
+                         'zh_as_ja_rate':false/max(1,count)}
+
     # NOT a gold test; weak test measures agreement with the source collection labels.
     # Independently evaluate externally sourced / human-reviewed data. This tier is
     # NEVER part of train/validation/weak test nor used to choose fusion weights.
@@ -280,7 +312,8 @@ def train_task(task,rows,out,args):
             'score_semantics':('foreign_phonetic_proxy probability ×100, not a real-world probability' if task=='writing' else
                                'Wikidata P103 person-native-language proxy, NOT name etymology')},\
            {'task':task,'data_counts':counts,'weak_test_metrics':metrics,'neural':neural_info,
-            'linear':info,'human_reviewed_test_rows':len(gold_test),'human_review_status':note,
+            'linear':info,'hard_case_audit':hard_audit,'zh_vs_ja':zh_ja_confusion,
+            'human_reviewed_test_rows':len(gold_test),'human_review_status':note,
             'human_review_metrics':gold_stats},gold_test
 
 
@@ -296,15 +329,23 @@ def run(args):
         wmeta={'note':'synthetic'};lmeta={'note':'synthetic','status':'ready'}
     else:
         source,provenance=acquire(args.cache,args.source_dir)
+        hard=load_hard_cases(args.hard_cases)
+        curated_zh=load_chinese_names(args.chinese_examples)
         wr,wmeta=build_writing(source,gold,args.max_per_class,args.seed)
+        wr,hardmeta=add_writing_hard_cases(wr,hard,gold,seed=args.seed,repeats=args.hard_repeats)
+        wmeta['hard_case_reinforcement']=hardmeta
         write_review_queue(wr,args.output/'review_queue.csv',seed=args.seed)
         lg,lmeta=language_records(args.cache/'wikidata',gold,args.wikidata_limit,args.wikidata,args.seed,
                                   min_per_language=args.min_language)
-    bundle={'format_version':3,'trainer_version':'3.0.0','generated_utc':datetime.now(timezone.utc).isoformat(),
+        if lmeta.get('status')=='ready':
+            lg,zhmeta=add_zh_language_support(lg,source,hard,curated_zh,gold,
+                          seed=args.seed,cap=args.zh_augment,hard_repeat=args.zh_hard_repeats)
+            lmeta['zh_training_support']=zhmeta
+    bundle={'format_version':3,'trainer_version':'3.3.0','generated_utc':datetime.now(timezone.utc).isoformat(),
             'seed':args.seed,'precision':'original-FP32; NO parameter quantization',
             'models':{},'provenance':{'writing':'corpus-membership WEAK supervision',
                                    'language':'8-class Wikidata P103 person native-language PROXY: zh/en/fr/de/es/ru/ja/ko'}}
-    report={'trainer_version':'3.0.0','generated_utc':bundle['generated_utc'],'training_mode':'DEMO_ONLY' if args.smoke else 'PUBLIC_WEAK_SUPERVISION',
+    report={'trainer_version':'3.3.0','generated_utc':bundle['generated_utc'],'training_mode':'DEMO_ONLY' if args.smoke else 'PUBLIC_WEAK_SUPERVISION',
             'hardware_note':'CPU compatible; parameters are from-scratch small architectures, not pretrained transformers',
             'data_sources':{'writing':wmeta,'language':lmeta,'upstream':provenance},
             'task_reports':{},'gold_test':'NO VERIFIED GOLD TEST; external generalization unproven',
@@ -314,6 +355,13 @@ def run(args):
     wr_report={}; gold_write=[]
     bundle['models']['writing'],wr_report,gold_write=train_task('writing',wr,args.output,args)
     report['task_reports']['writing']=wr_report
+    bundle['hard_case_training_audit']={
+        'n':wr_report.get('hard_case_audit',{}).get('n',0),
+        'correct':wr_report.get('hard_case_audit',{}).get('correct',0),
+        'all_correct':wr_report.get('hard_case_audit',{}).get('all_correct',False),
+        'note':'Training-set memorization check, not independent validation; HTML corrections are controlled separately'}
+    if wr_report.get('hard_case_audit',{}).get('n'):
+        (args.output/'HARD_CASE_AUDIT.json').write_text(json.dumps(wr_report['hard_case_audit'],ensure_ascii=False,indent=2),encoding='utf8')
     if gold_write:
         report['gold_test']='Human-reviewed gold rows evaluated independently on writing task; see per-task metrics.'
     lang_ready=lmeta.get('status')=='ready' and len(lg)>70
@@ -378,6 +426,13 @@ def run(args):
         lines.append('融合权重：'+json.dumps(tr['weak_test_metrics']['fusion']['weights'],ensure_ascii=False))
         lines.append('FP32 模型体积（字节）：'+json.dumps(component_sizes[task],ensure_ascii=False))
         lines.append('人工测试：'+tr['human_review_status'])
+        if task=='writing' and tr['hard_case_audit']['n']:
+            audit=tr['hard_case_audit']
+            lines.append(f'训练集硬例命中：{audit["correct"]}/{audit["n"]}（训练内检查，不可当测试准确率）')
+            lines.append('未命中：'+(','.join(r['name'] for r in audit['rows'] if not r['correct']) or '无'))
+        if task=='language' and tr['zh_vs_ja']:
+            diag=tr['zh_vs_ja']
+            lines.append(f'汉语错判为日语：{diag["zh_misclassified_as_ja"]}/{diag["zh_test_count"]}（独立弱标签测试集）')
         if tr['human_review_metrics']:
             lines.append(f'**独立人工金标准**：N={tr["human_reviewed_test_rows"]}；融合 Accuracy={tr["human_review_metrics"]["fusion"]["accuracy"]:.4f}，Macro-F1={tr["human_review_metrics"]["fusion"]["macro_f1"]:.4f}。')
         lines.append('')
@@ -410,9 +465,14 @@ def parse():
     ap.add_argument('--wikidata-limit',type=int,default=3500)
     ap.add_argument('--min-language',type=int,default=80)
     ap.add_argument('--seed',type=int,default=SEED)
+    ap.add_argument('--hard-cases',type=Path,default=Path('data/hard_cases.csv'))
+    ap.add_argument('--chinese-examples',type=Path,default=Path('data/chinese_hard_examples.txt'))
+    ap.add_argument('--hard-repeats',type=int,default=48)
+    ap.add_argument('--zh-augment',type=int,default=8000)
+    ap.add_argument('--zh-hard-repeats',type=int,default=12)
     ap.add_argument('--smoke',action='store_true')
     args=ap.parse_args()
-    if any(x<0 for x in (args.max_per_class,args.neural_per_class)) or args.max_features<200 or args.vocab_limit<30 or args.epochs<1 or args.batch_size<1 or args.embedding_dim<8 or args.gru_hidden<8 or args.cnn_channels<8 or max(args.embedding_dim,args.gru_hidden,args.cnn_channels)>256:
+    if any(x<0 for x in (args.max_per_class,args.neural_per_class,args.zh_augment,args.zh_hard_repeats)) or args.max_features<200 or args.vocab_limit<30 or args.epochs<1 or args.batch_size<1 or args.embedding_dim<8 or args.gru_hidden<8 or args.cnn_channels<8 or max(args.embedding_dim,args.gru_hidden,args.cnn_channels)>256:
         ap.error('invalid training limits')
     return args
 

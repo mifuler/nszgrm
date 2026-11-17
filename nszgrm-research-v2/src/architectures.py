@@ -91,10 +91,17 @@ def train_neural(architecture, rows, classes, val_rows, seed, *,
     selected=[]
     for lab in classes:
         group=[r for r in rows if r['label']==lab]
-        if per_class and len(group)>per_class:
-            indices=rng.choice(len(group),size=per_class,replace=False)
-            group=[group[int(i)] for i in indices]
-        selected.extend(group)
+        priority=[r for r in group if r.get('tier')=='hard_case']
+        others=[r for r in group if r.get('tier')!='hard_case']
+        if per_class:
+            if len(priority)>per_class:
+                raise ValueError('hard-case quota exceeds neural per-class budget')
+            quota=max(0,per_class-len(priority))
+            if len(others)>quota:
+                indices=rng.choice(len(others),size=quota,replace=False)
+                others=[others[int(i)] for i in indices]
+        selected.extend(priority)
+        selected.extend(others)
     rng.shuffle(selected)
     names=[r['name'] for r in selected]
     y=np.array([classes.index(r['label']) for r in selected],dtype=np.int64)
