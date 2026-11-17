@@ -6,6 +6,8 @@ on:
     paths:
       - 'nszgrm-research-v2/trigger-quantized-run-20261117.txt'
       - 'nszgrm-research-v2/src/**'
+      - 'nszgrm-research-v2/tests/**'
+      - 'nszgrm-research-v2/tools/**'
       - 'nszgrm-research-v2/data/hard_cases.csv'
       - 'nszgrm-research-v2/data/chinese_hard_examples.txt'
       - '.github/workflows/research-train.yml'
@@ -76,6 +78,11 @@ jobs:
           python-version: '3.11'
           cache: pip
           cache-dependency-path: nszgrm-research-v2/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install and verify OpenCC JS 1.4.2
+        run: python tools/install_opencc.py
       - name: Install numerical packages and CPU-only PyTorch
         run: |
           python -m pip install -r requirements.txt
@@ -210,11 +217,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: nszgrm-research-${{ github.run_id }}
           path: outputs
-      - name: Package models and reports only
+      - name: Package source and model outputs with maximum 7z compression
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -233,8 +241,28 @@ jobs:
           assert Path('outputs/models_fp32.json').stat().st_size <= 200_000_000
           assert Path('outputs/models_int8.json').stat().st_size < 15_000_000
           PY
-          zip -q -r "nszgrm-models-${GITHUB_RUN_ID}.zip" outputs
+          if ! command -v 7z >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y p7zip-full
+          fi
+          7z a -t7z -m0=lzma2 -mx=9 -mfb=273 -md=256m -ms=on -mmt=on \
+            "nszgrm-models-${GITHUB_RUN_ID}.7z" outputs
+          7z t "nszgrm-models-${GITHUB_RUN_ID}.7z"
+          mkdir -p "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer"
+          cp -a nszgrm-research-v2/. "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/"
+          mkdir -p "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/.github/workflows"
+          cp .github/workflows/research-train.yml \
+            "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/.github/workflows/research-train.yml"
+          rm -f "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer/MANIFEST.sha256"
+          (cd "$RUNNER_TEMP/package/NSZGRM-ResearchTrainer" && \
+            find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
+          (cd "$RUNNER_TEMP/package" && \
+            7z a -t7z -m0=lzma2 -mx=9 -mfb=273 -md=256m -ms=on -mmt=on \
+              "$GITHUB_WORKSPACE/NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z" \
+              NSZGRM-ResearchTrainer)
+          7z t NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z
           gh release create "research-v3-${GITHUB_RUN_ID}" \
-            "nszgrm-models-${GITHUB_RUN_ID}.zip" \
+            "nszgrm-models-${GITHUB_RUN_ID}.7z" \
+            "NSZGRM-ResearchTrainer-v3.3.1-OpenCC-1.4.2.7z" \
             --title "NSZGRM 3类书写 + 8类语言 FP32/量化模型 · Run ${GITHUB_RUN_ID}" \
             --notes-file outputs/REPORT.md --latest=false
