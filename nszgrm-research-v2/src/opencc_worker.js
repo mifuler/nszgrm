@@ -24,7 +24,7 @@ if (typeof convertJapanese !== 'function' || typeof convertTraditional !== 'func
 function toSimplified(text) {
   // OpenCC's Japanese dictionary handles shinjitai, then t2s handles any
   // remaining traditional characters. Same sequence for every name source.
-  return convertTraditional(convertJapanese(text));
+  return convertTraditional(convertJapanese(text)).replaceAll('郞', '郎');
 }
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
