@@ -1,0 +1,9 @@
+.cache/
+outputs/
+smoke*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.DS_Store
+gold-smoke/

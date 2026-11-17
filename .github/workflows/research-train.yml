@@ -1,0 +1,154 @@
+name: NSZGRM research ensemble (FP32 <= 200 MB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_per_class:
+        description: '写法分类：每类最多使用多少条弱标签姓名，0=不限量'
+        type: choice
+        required: true
+        default: '150000'
+        options: ['60000', '150000', '250000', '0']
+      neural_per_class:
+        description: 'TextCNN / BiGRU：每类最大训练量（按类别抽样）'
+        type: choice
+        required: true
+        default: '45000'
+        options: ['15000', '45000', '80000']
+      epochs:
+        description: '神经网络训练轮数上限；早停可能提前结束'
+        type: choice
+        required: true
+        default: '10'
+        options: ['5', '10', '15']
+      wikidata:
+        description: '多语言 P103 弱标签抓取策略，失败自动保留写法主模型'
+        type: choice
+        required: true
+        default: best_effort
+        options: [best_effort, required, 'off']
+      publish_release:
+        description: '训练结束时将模型、报告、离线 HTML 发布到 Release'
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: nszgrm-research-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    name: Supervised training + validation (Linux CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        working-directory: nszgrm-research-v2
+    env:
+      PYTHONUNBUFFERED: '1'
+      OPENBLAS_NUM_THREADS: '2'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      PYTORCH_ENABLE_MPS_FALLBACK: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: nszgrm-research-v2/requirements.txt
+      - name: Install numerical packages and CPU-only PyTorch
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install 'torch==2.6.0+cpu' --index-url https://download.pytorch.org/whl/cpu
+      - name: Static checks and deterministic offline unit tests
+        run: |
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+      - name: End-to-end smoke training (synthetic, no public claims)
+        run: |
+          python src/train_all.py --smoke --output smoke-artifacts \
+            --epochs 1 --neural-per-class 30 --max-features 600 \
+            --vocab-limit 150 --embedding-dim 16 --cnn-channels 16 \
+            --gru-hidden 16 --batch-size 128
+          node tests/verify_browser.js smoke-artifacts/models_fp32.json
+          python tests/verify_parity.py smoke-artifacts/models_fp32.json
+      - name: Acquire public corpora; train all models; evaluate held-out data
+        run: |
+          python src/train_all.py \
+            --output outputs --cache .cache/nszgrm \
+            --max-per-class '${{ inputs.max_per_class }}' \
+            --neural-per-class '${{ inputs.neural_per_class }}' \
+            --epochs '${{ inputs.epochs }}' \
+            --wikidata '${{ inputs.wikidata }}' \
+            --wikidata-limit 5000 --min-language 80 \
+            --max-features 60000 --vocab-limit 6000 \
+            --embedding-dim 128 --cnn-channels 96 --gru-hidden 128 \
+            --batch-size 256 --seed 20261117
+      - name: Verify generated full-precision models and offline JS inference
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          d=Path('outputs'); p=d/'models_fp32.json'; n=p.stat().st_size
+          assert n <= 200_000_000, f'FP32 models exceed 200 MB: {n}'
+          report=json.loads((d/'REPORT.json').read_text())
+          assert report['training_mode']=='PUBLIC_WEAK_SUPERVISION'
+          assert set(report['task_reports']['writing']['weak_test_metrics'])=={'linear','complement_nb','cnn','bigru','fusion'}
+          print('FP32 bytes:',n,'/ 200000000')
+          PY
+          node tests/verify_browser.js outputs/models_fp32.json
+          python tests/verify_parity.py outputs/models_fp32.json
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f outputs/REPORT.md ]; then
+            cat outputs/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '训练未正常完成：请检查失败步骤和标准错误日志。' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload training outputs even when a later audit fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nszgrm-research-${{ github.run_id }}
+          path: nszgrm-research-v2/outputs/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+  release:
+    name: Publish audited trained models
+    needs: train
+    if: ${{ inputs.publish_release == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nszgrm-research-${{ github.run_id }}
+          path: outputs
+      - name: Package final models (not upstream raw corpus)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -s outputs/REPORT.md
+          test -s outputs/models_fp32.json
+          test -s outputs/browser/index.html
+          python - <<'PY'
+          from pathlib import Path
+          assert Path('outputs/models_fp32.json').stat().st_size <= 200_000_000
+          PY
+          zip -q -r "nszgrm-fp32-${GITHUB_RUN_ID}.zip" outputs
+          gh release create "research-v2-${GITHUB_RUN_ID}" \
+            "nszgrm-fp32-${GITHUB_RUN_ID}.zip" \
+            --title "NSZGRM 多架构监督训练 · Run ${GITHUB_RUN_ID}" \
+            --notes-file outputs/REPORT.md --latest=false
