@@ -1,4 +1,4 @@
-name: NSZGRM research ensemble (FP32 <= 200 MB)
+name: NSZGRM research ensemble (FP32 <= 200 MB; 3 writing + 8 language)
 
 on:
   workflow_dispatch:
@@ -22,13 +22,13 @@ on:
         default: '10'
         options: ['5', '10', '15']
       wikidata:
-        description: '多语言 P103 弱标签抓取策略，失败自动保留写法主模型'
+        description: '八语言模型：required 强制八类齐全；best_effort 允许缺失并跳过语言模型；off 关闭'
         type: choice
         required: true
-        default: best_effort
-        options: [best_effort, required, 'off']
+        default: required
+        options: [required, best_effort, 'off']
       publish_release:
-        description: '训练结束时将模型、报告、离线 HTML 发布到 Release'
+        description: '训练结束时发布 FP32 模型和研究报告（不包含 HTML）'
         type: boolean
         required: true
         default: true
@@ -69,15 +69,14 @@ jobs:
         run: |
           python -m compileall -q src tests
           python -m unittest discover -s tests -v
-      - name: End-to-end smoke training (synthetic, no public claims)
+      - name: End-to-end smoke training (synthetic; never a performance claim)
         run: |
           python src/train_all.py --smoke --output smoke-artifacts \
             --epochs 1 --neural-per-class 30 --max-features 600 \
             --vocab-limit 150 --embedding-dim 16 --cnn-channels 16 \
             --gru-hidden 16 --batch-size 128
-          node tests/verify_browser.js smoke-artifacts/models_fp32.json
-          python tests/verify_parity.py smoke-artifacts/models_fp32.json
-      - name: Acquire public corpora; train all models; evaluate held-out data
+          python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language
+      - name: Acquire public corpora; train models; evaluate held-out data
         run: |
           python src/train_all.py \
             --output outputs --cache .cache/nszgrm \
@@ -89,20 +88,13 @@ jobs:
             --max-features 60000 --vocab-limit 6000 \
             --embedding-dim 128 --cnn-channels 96 --gru-hidden 128 \
             --batch-size 256 --seed 20261117
-      - name: Verify generated full-precision models and offline JS inference
+      - name: Verify model bundle, class coverage, reports and 200 MB budget
         run: |
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          d=Path('outputs'); p=d/'models_fp32.json'; n=p.stat().st_size
-          assert n <= 200_000_000, f'FP32 models exceed 200 MB: {n}'
-          report=json.loads((d/'REPORT.json').read_text())
-          assert report['training_mode']=='PUBLIC_WEAK_SUPERVISION'
-          assert set(report['task_reports']['writing']['weak_test_metrics'])=={'linear','complement_nb','cnn','bigru','fusion'}
-          print('FP32 bytes:',n,'/ 200000000')
-          PY
-          node tests/verify_browser.js outputs/models_fp32.json
-          python tests/verify_parity.py outputs/models_fp32.json
+          if [ '${{ inputs.wikidata }}' = 'required' ]; then
+            python tests/verify_outputs.py outputs --require-language
+          else
+            python tests/verify_outputs.py outputs
+          fi
       - name: Job summary
         if: always()
         run: |
@@ -122,7 +114,7 @@ jobs:
           compression-level: 6
 
   release:
-    name: Publish audited trained models
+    name: Publish audited FP32 models and reports (no HTML)
     needs: train
     if: ${{ inputs.publish_release == true }}
     runs-on: ubuntu-24.04
@@ -134,21 +126,23 @@ jobs:
         with:
           name: nszgrm-research-${{ github.run_id }}
           path: outputs
-      - name: Package final models (not upstream raw corpus)
+      - name: Package models and reports only
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           test -s outputs/REPORT.md
+          test -s outputs/REPORT.json
           test -s outputs/models_fp32.json
-          test -s outputs/browser/index.html
+          test -s outputs/train_manifest.json
+          ! find outputs -type f -iname '*.html' | grep -q .
           python - <<'PY'
           from pathlib import Path
           assert Path('outputs/models_fp32.json').stat().st_size <= 200_000_000
           PY
           zip -q -r "nszgrm-fp32-${GITHUB_RUN_ID}.zip" outputs
-          gh release create "research-v2-${GITHUB_RUN_ID}" \
+          gh release create "research-v3-${GITHUB_RUN_ID}" \
             "nszgrm-fp32-${GITHUB_RUN_ID}.zip" \
-            --title "NSZGRM 多架构监督训练 · Run ${GITHUB_RUN_ID}" \
+            --title "NSZGRM 3类书写 + 8类语言多模型训练 · Run ${GITHUB_RUN_ID}" \
             --notes-file outputs/REPORT.md --latest=false

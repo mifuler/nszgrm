@@ -23,7 +23,7 @@ from sklearn.naive_bayes import ComplementNB
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, f1_score, log_loss, confusion_matrix
 from architectures import train_neural, probabilities
 from corpus import acquire, build_writing, checks, language_records, write_review_queue
-from strong_data import load_gold, norm_name
+from strong_data import LANGS, load_gold
 
 def encode_numpy(x):
     if isinstance(x,np.generic):return x.item()
@@ -154,6 +154,8 @@ def train_task(task,rows,out,args):
     print(f'\n[task] {task}',flush=True)
     counts=checks(rows,task)
     classes=sorted(set(r['label'] for r in rows))
+    if task == 'language' and set(classes) != set(LANGS):
+        raise RuntimeError(f'language task requires all eight classes {sorted(LANGS)}; got {classes}')
     parts={name:[r for r in rows if r['split']==name and r.get('tier')!='gold']
            for name in ('train','val','test')}
     # Gold TRAIN and VAL may be used with evidenced labels; GOLD test NEVER in training
@@ -264,12 +266,6 @@ def train_task(task,rows,out,args):
             'human_review_metrics':gold_stats},gold_test
 
 
-def write_html(template: Path,bundle: dict,destination: Path):
-    text=template.read_text(encoding='utf8')
-    packed=json.dumps(bundle,ensure_ascii=False,separators=(',',':'),allow_nan=False,default=encode_numpy).replace('</','<\\/')
-    if '__BUNDLE_JSON__' not in text:raise RuntimeError('Web template has no bundle insertion marker')
-    destination.write_text(text.replace('__BUNDLE_JSON__',packed).replace('__RUNTIME_JS__',(template.parent/'runtime.js').read_text(encoding='utf8')),encoding='utf8')
-
 
 def run(args):
     args.output.mkdir(parents=True,exist_ok=True)
@@ -286,14 +282,15 @@ def run(args):
         write_review_queue(wr,args.output/'review_queue.csv',seed=args.seed)
         lg,lmeta=language_records(args.cache/'wikidata',gold,args.wikidata_limit,args.wikidata,args.seed,
                                   min_per_language=args.min_language)
-    bundle={'format_version':2,'generated_utc':datetime.now(timezone.utc).isoformat(),
+    bundle={'format_version':3,'trainer_version':'3.0.0','generated_utc':datetime.now(timezone.utc).isoformat(),
             'seed':args.seed,'precision':'original-FP32; NO parameter quantization',
             'models':{},'provenance':{'writing':'corpus-membership WEAK supervision',
-                                   'language':'Wikidata P103 person native-language PROXY'}}
-    report={'generated_utc':bundle['generated_utc'],'training_mode':'DEMO_ONLY' if args.smoke else 'PUBLIC_WEAK_SUPERVISION',
+                                   'language':'8-class Wikidata P103 person native-language PROXY: zh/en/fr/de/es/ru/ja/ko'}}
+    report={'trainer_version':'3.0.0','generated_utc':bundle['generated_utc'],'training_mode':'DEMO_ONLY' if args.smoke else 'PUBLIC_WEAK_SUPERVISION',
             'hardware_note':'CPU compatible; parameters are from-scratch small architectures, not pretrained transformers',
             'data_sources':{'writing':wmeta,'language':lmeta,'upstream':provenance},
-            'task_reports':{},'gold_test':'NO VERIFIED GOLD TEST; external generalization unproven'}
+            'task_reports':{},'gold_test':'NO VERIFIED GOLD TEST; external generalization unproven',
+            'language_classes_expected':sorted(LANGS)}
     with (args.output/'train_manifest.json').open('w',encoding='utf8') as f:
         json.dump(report['data_sources'],f,ensure_ascii=False,indent=2,default=encode_numpy)
     wr_report={}; gold_write=[]
@@ -302,17 +299,22 @@ def run(args):
     if gold_write:
         report['gold_test']='Human-reviewed gold rows evaluated independently on writing task; see per-task metrics.'
     lang_ready=lmeta.get('status')=='ready' and len(lg)>70
+    if args.wikidata == 'required' and not lang_ready:
+        raise RuntimeError('The requested 8-class language model is incomplete. '
+                           f'Status={lmeta.get("status")}; missing={lmeta.get("missing_languages", [])}; '
+                           'rerun with Wikidata available or explicitly choose best_effort.')
     if lang_ready:
-        # Proxy class split may have extremely few in some partitions. Handle as unavailable rather than falsifying labels.
         try:
             bundle['models']['language'],l_report,gold_lang=train_task('language',lg,args.output,args)
             report['task_reports']['language']=l_report
         except (ValueError,RuntimeError) as e:
+            if args.wikidata == 'required':
+                raise
             print('[warn] language proxy training unusable:',str(e)[:500],flush=True)
             report['task_reports']['language']={'status':'unavailable','reason':str(e)}
     else:
         report['task_reports']['language']={'status':'unavailable',
-                     'reason':'insufficient verified proxy coverage; language model not fabricated',
+                     'reason':'the complete eight-class proxy set is unavailable; partial classes are not trained or published',
                      'source_status':lmeta}
     # Fully original float32 weights; counted as ALL training-produced deployable models.
     model_path=args.output/'models_fp32.json'
@@ -324,17 +326,27 @@ def run(args):
     report['size_budget']={'model_file':'models_fp32.json','model_raw_bytes':bytes_models,
                            'max_raw_bytes':BYTE_CAP,'within_budget':bytes_models<=BYTE_CAP,
                            'model_component_raw_bytes':component_sizes,
-                           'double_count_note':'HTML embeds a copy of these same parameters for file:// offline execution; it is not an additional trained model'}
+                           'output_policy':'training package exports model parameters and research reports only; no HTML is generated'}
     if bytes_models > BYTE_CAP:
         raise RuntimeError(f'ORIGINAL models {bytes_models:,} bytes exceed {BYTE_CAP:,} bytes. '
                            'Reduce --max-features or --vocab-limit, not quantization.')
-    webdir=args.output/'browser';webdir.mkdir(exist_ok=True)
-    write_html(Path(__file__).resolve().parents[1]/'web'/'template.html',bundle,webdir/'index.html')
-    report['artifacts']={'model':str(model_path),'browser':str(webdir/'index.html')}
+    # This training package deliberately does not generate or bundle an HTML front end.
+    # Remove stale HTML from a reused output directory so old runs cannot be mistaken
+    # for artifacts of the current training execution.
+    for stale in args.output.rglob('*.html'):
+        stale.unlink()
+    stale_browser=args.output/'browser'
+    if stale_browser.exists() and stale_browser.is_dir():
+        import shutil
+        shutil.rmtree(stale_browser)
+    report['artifacts']={'model':str(model_path),'report_json':str(args.output/'REPORT.json'),
+                         'report_markdown':str(args.output/'REPORT.md'),
+                         'manifest':str(args.output/'train_manifest.json')}
     (args.output/'REPORT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2,default=encode_numpy),encoding='utf8')
     lines=['# 中文姓名多模型训练报告','',f'训练模式：{report["training_mode"]}',
            f'原精度模型总大小：{bytes_models:,} / {BYTE_CAP:,} 字节',
-           '模型参数均为 FP32，未量化；所有分类器独立评分并经验证集融合。','']
+           '模型参数均为 FP32，未量化；所有分类器独立评分并经验证集融合。',
+           '本训练工程只导出模型 JSON、数据清单、评估报告和人工复核队列，不生成 HTML。','']
     for task,tr in report['task_reports'].items():
         lines.append(f'## {task}')
         if 'weak_test_metrics' not in tr:
@@ -376,7 +388,7 @@ def parse():
     ap.add_argument('--gru-hidden',type=int,default=128)
     ap.add_argument('--epochs',type=int,default=10)
     ap.add_argument('--batch-size',type=int,default=256)
-    ap.add_argument('--wikidata',choices=['best_effort','required','off'],default='best_effort')
+    ap.add_argument('--wikidata',choices=['required','best_effort','off'],default='required')
     ap.add_argument('--wikidata-limit',type=int,default=3500)
     ap.add_argument('--min-language',type=int,default=80)
     ap.add_argument('--seed',type=int,default=SEED)

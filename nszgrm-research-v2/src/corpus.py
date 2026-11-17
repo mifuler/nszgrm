@@ -35,8 +35,19 @@ def split3(group: str, seed: int):
     return 'train' if x<0.80 else ('val' if x<0.90 else 'test')
 
 
-WD = {'en':'Q1860', 'ru':'Q7737', 'ja':'Q5287', 'fr':'Q150',
-      'es':'Q1321', 'de':'Q188', 'ko':'Q9176'}
+# The language task has exactly eight labels. For zh, pool Wikidata's
+# Chinese macro-language, Mandarin and Standard Chinese native-language values.
+# These are P103 person-native-language proxies, NOT verified name etymologies.
+WD = {
+    'zh': ('Q7850', 'Q9192', 'Q727694'),
+    'en': ('Q1860',),
+    'ru': ('Q7737',),
+    'ja': ('Q5287',),
+    'fr': ('Q150',),
+    'es': ('Q1321',),
+    'de': ('Q188',),
+    'ko': ('Q9176',),
+}
 
 
 def digest(path: Path) -> str:
@@ -134,7 +145,7 @@ def _wd_query(lang_qid: str, limit: int):
 
 def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path):
     cache.mkdir(parents=True,exist_ok=True)
-    path = cache / f'P103_{lang}_{max_rows}.json'
+    path = cache / f'P103_{lang}_{qid}_{max_rows}.json'
     if path.is_file():
         raw = json.loads(path.read_text(encoding='utf8'))
     else:
@@ -166,15 +177,21 @@ def language_records(cache: Path, gold: list[dict], max_rows: int, mode: str, se
                      min_per_language: int = 80):
     """Build P103 proxy labels. Splits group Wikidata entity and same-surface aliases."""
     if mode == 'off': return [],{'status':'disabled','warning':'Language task disabled'}
-    raw={}; errors={}
-    for lang,qid in WD.items():
+    raw={}; errors={}; query_items={}
+    for lang,qids in WD.items():
+        qids = (qids,) if isinstance(qids, str) else tuple(qids)
+        query_items[lang] = list(qids)
+        merged=set()
         try:
-            print(f'[wikidata] {lang} native-language proxy {qid}',flush=True)
-            raw[lang] = fetch_wikidata(lang,qid,max_rows,cache)
+            for qid in qids:
+                print(f'[wikidata] {lang} native-language proxy {qid}',flush=True)
+                merged.update(fetch_wikidata(lang,qid,max_rows,cache))
+                time.sleep(0.4)
+            raw[lang] = sorted(merged)
         except Exception as e:
             errors[lang]=str(e)
             if mode == 'required': raise
-        time.sleep(0.4)
+            raw[lang] = sorted(merged)
     by_name=defaultdict(set); by_entity=defaultdict(set)
     for lang,rows in raw.items():
         for ent,name in rows:
@@ -217,10 +234,15 @@ def language_records(cache: Path, gold: list[dict], max_rows: int, mode: str, se
     name_splits=defaultdict(set)
     for row in rows: name_splits[row['name']].add(row['split'])
     rows=[r for r in rows if len(name_splits[r['name']])==1]
-    status='ready' if len(eligible)>=2 else 'insufficient'
+    expected=set(WD)
+    missing=sorted(expected-eligible)
+    status='ready' if not missing and not errors else ('partial' if eligible else 'insufficient')
     return rows,{'status':status,'failed_languages':errors,'source_rows':dict(count),
-        'eligible_languages':sorted(eligible),'final_rows':dict(Counter(r['label'] for r in rows)),
-        'proxy_semantics':'Wikidata P103 is person native language, not name etymology; no verified origin-language claims.'}
+        'query_items':query_items,'expected_languages':sorted(expected),
+        'eligible_languages':sorted(eligible),'missing_languages':missing,
+        'final_rows':dict(Counter(r['label'] for r in rows)),
+        'proxy_semantics':'Wikidata P103 is person native language, not name etymology; no verified origin-language claims.',
+        'zh_proxy_items':['Q7850 Chinese','Q9192 Mandarin','Q727694 Standard Chinese']}
 
 
 def checks(rows: list[dict], task: str):

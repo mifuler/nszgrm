@@ -29,6 +29,6 @@ git add nszgrm-research-v2 .github/workflows/research-train.yml
 if git diff --cached --quiet; then echo '代码已是最新，不需要再次提交。'; exit 0; fi
 git -c user.name="$(gh api user --jq .login)" \
     -c user.email="$(gh api user --jq '.id')+$(gh api user --jq .login)@users.noreply.github.com" \
-    commit -m 'Add NSZGRM v2 FP32 multi-architecture research trainer (200MB cap)'
+    commit -m 'Add NSZGRM v3 Chinese 8-language model-only trainer (200MB cap)'
 git push origin "HEAD:$BRANCH"
 echo '已提交：https://github.com/'"$REPO"'/actions/workflows/research-train.yml'

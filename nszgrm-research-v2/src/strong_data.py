@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 LABELS = ('zh_native', 'foreign_phonetic_proxy', 'ja_kanji_proxy')
-LANGS = ('en', 'ru', 'ja', 'fr', 'es', 'de', 'ko')
+LANGS = ('zh', 'en', 'ru', 'ja', 'fr', 'es', 'de', 'ko')
 HAN = re.compile(r'^[\u3400-\u9fff]{2,8}$')
 GOLD_COLUMNS = ('name', 'writing_type', 'origin_lang', 'group_id', 'reference_url', 'reviewer', 'split')
 

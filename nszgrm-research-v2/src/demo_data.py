@@ -20,7 +20,7 @@ def demo(seed=20261117):
                     wr.append({'name':name,'label':lab,'group':name,'tier':'weak',
                                'split':split3('write:'+name,seed)})
     lg=[]
-    demo={'en':['麦','布','克'], 'ru':['伊','维','弗'], 'ja':['山','田','村'],
+    demo={'zh':['张','李','王'], 'en':['麦','布','克'], 'ru':['伊','维','弗'], 'ja':['山','田','村'],
           'fr':['皮','路','德'], 'es':['罗','加','塞'], 'de':['汉','赫','施'], 'ko':['金','朴','崔']}
     for lab,prefixes in demo.items():
         for ch in prefixes:
