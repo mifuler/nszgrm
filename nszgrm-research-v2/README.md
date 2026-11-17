@@ -1,6 +1,6 @@
-# NSZGRM · 中文姓名多模型监督训练工程（v3）
+# NSZGRM · 中文姓名多模型监督训练工程（v3.1）
 
-本工程使用 Python 在 GitHub Actions 的 Ubuntu Linux CPU 环境训练中文姓名模型。它只负责**数据获取、监督训练、模型融合、评估和结果保存**；不生成 HTML，不包含浏览器前端。HTML 将由独立项目读取训练输出的 `models_fp32.json` 开发。
+本工程使用 Python 在 GitHub Actions 的 Ubuntu Linux CPU 环境训练中文姓名模型。它只负责**数据获取、监督训练、模型融合、评估和结果保存**；不生成 HTML，不包含浏览器前端。HTML 由独立项目开发，可按需读取 `models_fp32.json` 或 `models_int8.json`。
 
 训练分为两个相互独立的任务：
 
@@ -66,9 +66,13 @@
 
 ## 模型体积与精度
 
-全部部署参数以原始 FP32 数值导出到一个 `models_fp32.json`。**200,000,000 字节（十进制）是硬上限**，超出即终止训练，不会通过量化或压缩绕过。报告同时列出每项任务、每个子模型的原始参数体积。
+每次正式训练同时交付两份模型：`models_fp32.json` 保留完整 FP32 参数，硬上限为 200,000,000 字节；`models_int8.json` 使用逐输出行对称 INT8 权重量化，必要时对个别模型回退到 INT16，偏置、IDF、温度和融合权重保留 FP32。量化文件原始大小必须严格小于 **15,000,000 字节**。
 
-本训练包不生成 HTML，也不生成浏览器资源。独立前端只需读取 `models_fp32.json`，前端格式和展示方式由单独工程维护。模型 JSON 的字段、类别顺序、温度校准和融合公式见 [`MODEL_SCHEMA.md`](MODEL_SCHEMA.md)。
+量化不是只看文件大小。训练后会从本轮训练的独立测试划分中分层抽样，分别对四个子模型和融合模型计算 Accuracy、Macro-F1；任一模型的相对损耗超过 10%，就把失败模型切换为 INT16 后重新评测。若融合模型仍失败，则扩大回退范围；最终仍不能通过，Actions 不会发布 Release。评测样本属于语料弱标签，不能代替人工金标准。
+
+Wikidata 下载优先使用 aria2c，失败时由 urllib 继续重试。HTTP 截断、超时、无效 JSON 不会写入缓存；有效响应通过原子替换保存，最多六轮指数退避。
+
+本训练包不生成 HTML。独立前端可以分别加载 FP32 和量化模型，具体张量格式见 [`MODEL_SCHEMA.md`](MODEL_SCHEMA.md)。
 
 ## 一键推送到 `mifuler/nszgrm`
 
@@ -97,9 +101,9 @@ bash push-existing.sh mifuler/nszgrm
 
 推送脚本会克隆目标仓库，将训练工程放在独立目录 `nszgrm-research-v2/`，并更新 `.github/workflows/research-train.yml`。它不会删除仓库根目录 `LICENSE`、旧版模型文件或其他工作流；仅同步新版训练工程目录。
 
-## 网页启动 Actions
+## 推送与启动 Actions
 
-使用 `mifuler` 账号打开：
+首次使用 Termux 执行 `push-existing.sh` 时，会把一次性触发标记一并推送到 `main`；工作流因此自动启动，使用 150000 / 45000 / 10 epochs / required / publish release 的默认配置。以后重新训练时，使用 `mifuler` 账号打开：
 
 <https://github.com/mifuler/nszgrm/actions/workflows/research-train.yml>
 
@@ -116,7 +120,7 @@ bash push-existing.sh mifuler/nszgrm
 
 `required` 会要求八个语言类别全部达到最低样本量。若 Wikidata 服务临时故障，先检查日志；不要把 `best_effort` 产生的部分语言模型当作八分类成品。
 
-工作流使用标准 `ubuntu-24.04` CPU，最多运行 350 分钟。会先执行单元测试和合成数据烟雾训练，再下载真实公开语料、训练、评估、验证模型结构和 200 MB 上限。
+工作流使用标准 `ubuntu-24.04` CPU，最多运行 350 分钟。会先执行单元测试和合成数据烟雾训练，再安装 aria2、下载真实公开语料、训练、量化、评估损耗，并验证 200 MB FP32 与 15 MB 量化上限。
 
 ## 输出内容
 
@@ -125,6 +129,9 @@ bash push-existing.sh mifuler/nszgrm
 ```text
 outputs/
 ├── models_fp32.json
+├── models_int8.json
+├── LOSS_REPORT.json
+├── QUANT_AUDIT.json
 ├── REPORT.json
 ├── REPORT.md
 ├── train_manifest.json
@@ -137,7 +144,10 @@ outputs/
 
 实际文件会根据人工审核数据和语言模型是否成功生成而略有不同。不会包含 `.html` 文件。
 
-- `models_fp32.json`：两项任务的类别、四个模型参数、各模型温度系数和融合权重。
+- `models_fp32.json`：两项任务的原始 FP32 参数、类别、温度系数和融合权重。
+- `models_int8.json`：逐行 INT8/INT16 量化参数；模型布局与 FP32 一致。
+- `LOSS_REPORT.json`：各子模型和融合模型在分层弱标签测试样本上的量化损耗。
+- `QUANT_AUDIT.json`：量化权重误差、INT16 回退名单和文件体积。
 - `REPORT.json`：逐模型与融合指标、混淆矩阵、校准指标、数据计数和模型体积。
 - `REPORT.md`：可直接阅读的训练摘要。
 - `train_manifest.json`：下载来源、版本、SHA256 和数据清洗记录。
@@ -165,7 +175,7 @@ python src/train_all.py --smoke --output smoke-artifacts \
   --vocab-limit 150 --embedding-dim 16 --cnn-channels 16 \
   --gru-hidden 16 --batch-size 128
 
-python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language
+python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language --skip-quantized
 ```
 
 `--smoke` 只验证代码结构和训练流程，合成数据指标不能作为研究结果。
@@ -180,8 +190,14 @@ python src/train_all.py --output outputs --cache .cache/nszgrm \
   --epochs 10 --batch-size 256 --wikidata required \
   --wikidata-limit 5000 --min-language 80 --seed 20261117
 
+python src/quantize_existing.py --source outputs/models_fp32.json --out outputs --int16-models language/linear
+node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+  .cache/quant_eval_samples.json outputs/LOSS_REPORT.json
+python src/record_quant_report.py outputs
 python tests/verify_outputs.py outputs --require-language
 ```
+
+本地命令展示首轮量化和验收；如果某个模型损耗超过 10%，需要根据 LOSS_REPORT.json 将该模型加入 INT16 回退名单并重新量化。GitHub Actions 已自动执行选择性回退和复测。
 
 ## 当前研究限制
 
@@ -189,4 +205,4 @@ python tests/verify_outputs.py outputs --require-language
 2. 书写语料存在来源差异、非人名混入和现代/古代姓名分布差异。
 3. 八分类只覆盖指定的七种外语及中文，不代表所有语言；阿拉伯语、印度语言等不在本轮模型范围内。
 4. 如果没有足量人工核验的独立测试数据，不能宣称模型已达到真实世界可靠性。
-5. 该版本没有 HTML、没有浏览器推理代码，也不负责量化。量化和前端由独立工程处理。
+5. 该版本不生成 HTML。量化模型由训练工作流生成；浏览器界面仍由独立前端工程开发。

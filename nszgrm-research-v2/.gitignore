@@ -7,3 +7,7 @@ __pycache__/
 .venv/
 .DS_Store
 gold-smoke/
+*.part
+*.aria2
+quant_out/
+source/

@@ -258,6 +258,24 @@ def train_task(task,rows,out,args):
             writer.writerow([row['name'],'','','','','','',row['label'],
                              classes[int(ensemble[i].argmax())],round(float(ensemble[i].max()),4),
                              len({int(v[i].argmax()) for v in indiv.values()})])
+    # Save a small stratified sample of this already-held-out weak test split for
+    # the post-training quantization loss gate. It stays in .cache, not in release.
+    eval_path=args.cache.parent/'quant_eval_samples.json'
+    eval_path.parent.mkdir(parents=True,exist_ok=True)
+    try:
+        eval_data=json.loads(eval_path.read_text(encoding='utf8')) if eval_path.is_file() else {'tasks':{}}
+    except (OSError,ValueError,json.JSONDecodeError):
+        eval_data={'tasks':{}}
+    sample_cap=500 if task=='writing' else 400
+    eval_rng=random.Random(args.seed+(1103 if task=='writing' else 2207))
+    eval_rows=[]
+    for label in classes:
+        pool=sorted((r for r in test if r['label']==label),key=lambda r:r['name'])
+        take=eval_rng.sample(pool,min(sample_cap,len(pool)))
+        eval_rows.extend({'name':r['name'],'label':r['label']} for r in take)
+    eval_data.setdefault('tasks',{})[task]=eval_rows
+    eval_path.write_text(json.dumps(eval_data,ensure_ascii=False,separators=(',',':')),encoding='utf8')
+    print(f'[quantization] saved held-out evaluation sample: {task} n={len(eval_rows)}',flush=True)
     return {'task':task,'classes':classes,'models':exports,'fusion_weights':dict(zip(MODEL_NAMES,w)),
             'score_semantics':('foreign_phonetic_proxy probability ×100, not a real-world probability' if task=='writing' else
                                'Wikidata P103 person-native-language proxy, NOT name etymology')},\

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from strong_data import LANGS, norm_name, load_gold
-from corpus import WD, language_records, split3, checks
+from corpus import WD, fetch_wikidata, language_records, split3, checks
 from train_all import BYTE_CAP,choose_weights,temperature,train_task
 import numpy as np
 
@@ -37,6 +37,25 @@ class TrainerTests(unittest.TestCase):
             checks([dict(name='林肯',label='a',group='lincoln',split='train'),
                     dict(name='林肯二',label='a',group='lincoln',split='test')],'test')
 
+
+    def test_truncated_wikidata_cache_is_discarded_and_retried(self):
+        import json
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self,*args): return False
+            def read(self):
+                return json.dumps({'results':{'bindings':[{
+                    'person':{'value':'https://www.wikidata.org/entity/Q123'},
+                    'name':{'value':'林肯'}}]}}).encode('utf-8')
+        with tempfile.TemporaryDirectory() as temp:
+            cache=Path(temp)
+            cached=cache/'P103_en_Q1860_10.json'
+            cached.write_text('{"results":',encoding='utf-8')
+            with patch('corpus.shutil.which',return_value=None), \
+                 patch('corpus.urllib.request.urlopen',return_value=FakeResponse()):
+                rows=fetch_wikidata('en','Q1860',10,cache)
+            self.assertEqual(rows,[('Q123','林肯')])
+            self.assertEqual(json.loads(cached.read_text(encoding='utf-8'))['results']['bindings'][0]['name']['value'],'林肯')
 
     def test_language_model_has_eight_classes_including_chinese(self):
         self.assertEqual(set(LANGS), {'zh','en','fr','de','es','ru','ja','ko'})

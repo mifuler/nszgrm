@@ -6,6 +6,7 @@ etymologies. P103 is a person's native language, NOT the etymology of their name
 from __future__ import annotations
 import csv
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import tarfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
@@ -76,11 +78,45 @@ def acquire(cache: Path, source_dir: Path | None = None):
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
                 print('[data] git clone unavailable; codeload fallback:', str(err)[:220], flush=True)
                 if root.exists(): shutil.rmtree(root)
-                req = urllib.request.Request('https://codeload.github.com/wainshine/Chinese-Names-Corpus/tar.gz/refs/heads/master',
-                    headers={'User-Agent':'NSZGRM-ResearchTrainer/2.0 (GitHub Actions)'})
-                with urllib.request.urlopen(req, timeout=150) as resp:
-                    archive = cache / 'corpus.tar.gz'
-                    with archive.open('wb') as dst: shutil.copyfileobj(resp, dst)
+                archive = cache / 'corpus.tar.gz'
+                part = cache / 'corpus.tar.gz.part'
+                url = 'https://codeload.github.com/wainshine/Chinese-Names-Corpus/tar.gz/refs/heads/master'
+                headers = {'User-Agent':'NSZGRM-ResearchTrainer/3.1 (GitHub Actions)',
+                           'Accept':'application/vnd.github+json'}
+                downloaded = False
+                if shutil.which('aria2c'):
+                    try:
+                        _aria2_download(url,part,headers)
+                        with tarfile.open(part,'r:gz') as check_archive:
+                            check_archive.next()
+                        os.replace(part,archive)
+                        downloaded = True
+                        print('[data] corpus archive downloaded with aria2',flush=True)
+                    except Exception as aria_error:
+                        part.unlink(missing_ok=True)
+                        print('[data] aria2 archive attempt failed; using urllib fallback:',str(aria_error)[:180],flush=True)
+                last_error = None
+                for attempt in range(4) if not downloaded else []:
+                    try:
+                        req = urllib.request.Request(url,headers=headers)
+                        with urllib.request.urlopen(req,timeout=180) as resp:
+                            payload = resp.read()
+                        part.write_bytes(payload)
+                        with tarfile.open(part,'r:gz') as check_archive:
+                            check_archive.next()
+                        os.replace(part,archive)
+                        downloaded = True
+                        print(f'[data] corpus archive downloaded with urllib on attempt {attempt+1}',flush=True)
+                        break
+                    except (OSError,ValueError,http.client.HTTPException,urllib.error.URLError,TimeoutError) as download_error:
+                        last_error = download_error
+                        part.unlink(missing_ok=True)
+                        if attempt < 3:
+                            delay = min(30,4*(2**attempt))+random.uniform(0,1)
+                            print(f'[data] archive retry {attempt+1}/4 in {delay:.1f}s',flush=True)
+                            time.sleep(delay)
+                if not downloaded:
+                    raise RuntimeError(f'Corpus archive download failed: {last_error}')
                 # Only regular files with safe paths are allowed.
                 root.mkdir(parents=True, exist_ok=True)
                 with tarfile.open(archive, 'r:gz') as tar:
@@ -143,35 +179,95 @@ def _wd_query(lang_qid: str, limit: int):
     }} LIMIT {limit}'''
 
 
+def _read_wikidata_payload(path: Path):
+    raw=json.loads(path.read_text(encoding='utf8'))
+    if not isinstance(raw,dict) or not isinstance(raw.get('results'),dict):
+        raise ValueError('Wikidata response has no results object')
+    if not isinstance(raw['results'].get('bindings'),list):
+        raise ValueError('Wikidata response has no bindings list')
+    return raw
+
+
+def _aria2_download(url: str, dest: Path, headers: dict[str,str] | None = None):
+    """Download with aria2 retry/reconnect handling; caller validates the payload."""
+    exe=shutil.which('aria2c')
+    if not exe:
+        raise FileNotFoundError('aria2c is not installed')
+    headers=headers or {'User-Agent':'NSZGRMNameResearch/3.1 (https://github.com/mifuler/nszgrm)',
+                         'Accept':'application/sparql-results+json'}
+    cmd=[exe,'--max-tries=4','--retry-wait=5','--timeout=150',
+         '--connect-timeout=30','--file-allocation=none',
+         '--allow-overwrite=true','--auto-file-renaming=false',
+         '--check-certificate=true','--console-log-level=warn']
+    for key,value in headers.items():
+        cmd.extend(['--header',f'{key}: {value}'])
+    cmd.extend(['--dir',str(dest.parent),'--out',dest.name,url])
+    subprocess.run(cmd,check=True,timeout=700,stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE)
+
+
 def fetch_wikidata(lang: str, qid: str, max_rows: int, cache: Path):
     cache.mkdir(parents=True,exist_ok=True)
-    path = cache / f'P103_{lang}_{qid}_{max_rows}.json'
+    path=cache/f'P103_{lang}_{qid}_{max_rows}.json'
+    raw=None
     if path.is_file():
-        raw = json.loads(path.read_text(encoding='utf8'))
-    else:
-        url = 'https://query.wikidata.org/sparql?' + urllib.parse.urlencode(
+        try:
+            raw=_read_wikidata_payload(path)
+        except (OSError,ValueError,json.JSONDecodeError):
+            print(f'[wikidata] discard incomplete cache: {path.name}',flush=True)
+            path.unlink(missing_ok=True)
+    if raw is None:
+        url='https://query.wikidata.org/sparql?'+urllib.parse.urlencode(
             {'query':_wd_query(qid,max_rows),'format':'json'})
-        err = None
-        for attempt in range(2):
+        headers={'User-Agent':'NSZGRMNameResearch/3.1 (https://github.com/mifuler/nszgrm)',
+                 'Accept':'application/sparql-results+json'}
+        last_error=None
+        part=path.with_name(path.name+'.part')
+        for attempt in range(6):
+            part.unlink(missing_ok=True)
+            if shutil.which('aria2c'):
+                try:
+                    _aria2_download(url,part,headers)
+                    raw=_read_wikidata_payload(part)
+                    os.replace(part,path)
+                    print(f'[wikidata] aria2 download complete: {lang}/{qid} '
+                          f'({len(raw["results"]["bindings"])} rows)',flush=True)
+                    break
+                except Exception as e:
+                    last_error=e
+                    part.unlink(missing_ok=True)
+                    print(f'[wikidata] aria2 attempt {attempt+1}/6 failed: {str(e)[:180]}',flush=True)
             try:
-                req=urllib.request.Request(url,headers={
-                    'User-Agent':'NSZGRMNameResearch/2.0 (https://github.com/mifuler/nszgrm)',
-                    'Accept':'application/sparql-results+json'})
-                with urllib.request.urlopen(req,timeout=95) as resp:
-                    raw=json.loads(resp.read().decode('utf8'))
-                path.write_text(json.dumps(raw,ensure_ascii=False),encoding='utf8')
+                req=urllib.request.Request(url,headers=headers)
+                with urllib.request.urlopen(req,timeout=180) as resp:
+                    payload=resp.read()
+                parsed=json.loads(payload.decode('utf8'))
+                if not isinstance(parsed,dict) or not isinstance(parsed.get('results'),dict) \
+                        or not isinstance(parsed['results'].get('bindings'),list):
+                    raise ValueError('Wikidata returned an invalid SPARQL JSON document')
+                part.write_bytes(payload)
+                os.replace(part,path)
+                raw=parsed
+                print(f'[wikidata] urllib download complete: {lang}/{qid} '
+                      f'({len(raw["results"]["bindings"])} rows)',flush=True)
                 break
-            except (OSError, ValueError) as e:
-                err = e
-                if attempt == 0: time.sleep(4)
-        else: raise RuntimeError(f'{lang}: {err}')
+            except (OSError,ValueError,UnicodeError,http.client.HTTPException,
+                    urllib.error.URLError,TimeoutError) as e:
+                last_error=e
+                part.unlink(missing_ok=True)
+                if attempt<5:
+                    delay=min(60,5*(2**attempt))+random.uniform(0,2)
+                    print(f'[wikidata] retry {attempt+1}/6 in {delay:.1f}s: {str(e)[:180]}',flush=True)
+                    time.sleep(delay)
+        if raw is None:
+            raise RuntimeError(f'{lang}/{qid}: Wikidata download failed after 6 attempts: {last_error}')
     out=set()
     for row in raw.get('results',{}).get('bindings',[]):
         name=norm_name(row.get('name',{}).get('value',''))
         entity=row.get('person',{}).get('value','').rsplit('/',1)[-1]
-        if name and re.fullmatch(r'Q[1-9]\d*',entity): out.add((entity,name))
+        if name and re.fullmatch(r'Q[1-9]\d*',entity):
+            out.add((entity,name))
     return sorted(out)
-
 
 def language_records(cache: Path, gold: list[dict], max_rows: int, mode: str, seed: int,
                      min_per_language: int = 80):

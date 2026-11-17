@@ -1,6 +1,10 @@
-name: NSZGRM research ensemble (FP32 <= 200 MB; 3 writing + 8 language)
+name: NSZGRM research ensemble (FP32 <= 200 MB; quantized < 15 MB; 3 writing + 8 language)
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'nszgrm-research-v2/trigger-quantized-run-20261117.txt'
   workflow_dispatch:
     inputs:
       max_per_class:
@@ -28,7 +32,7 @@ on:
         default: required
         options: [required, best_effort, 'off']
       publish_release:
-        description: '训练结束时发布 FP32 模型和研究报告（不包含 HTML）'
+        description: '训练结束时发布 FP32、量化模型和研究报告（不包含 HTML）'
         type: boolean
         required: true
         default: true
@@ -56,6 +60,11 @@ jobs:
       PYTORCH_ENABLE_MPS_FALLBACK: '0'
     steps:
       - uses: actions/checkout@v4
+      - name: Install aria2 downloader
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+          aria2c --version
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -75,22 +84,66 @@ jobs:
             --epochs 1 --neural-per-class 30 --max-features 600 \
             --vocab-limit 150 --embedding-dim 16 --cnn-channels 16 \
             --gru-hidden 16 --batch-size 128
-          python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language
+          python tests/verify_outputs.py smoke-artifacts --allow-demo --require-language --skip-quantized
       - name: Acquire public corpora; train models; evaluate held-out data
         run: |
+          rm -f .cache/quant_eval_samples.json
           python src/train_all.py \
             --output outputs --cache .cache/nszgrm \
-            --max-per-class '${{ inputs.max_per_class }}' \
-            --neural-per-class '${{ inputs.neural_per_class }}' \
-            --epochs '${{ inputs.epochs }}' \
-            --wikidata '${{ inputs.wikidata }}' \
+            --max-per-class '${{ inputs.max_per_class || '150000' }}' \
+            --neural-per-class '${{ inputs.neural_per_class || '45000' }}' \
+            --epochs '${{ inputs.epochs || '10' }}' \
+            --wikidata '${{ inputs.wikidata || 'required' }}' \
             --wikidata-limit 5000 --min-language 80 \
             --max-features 60000 --vocab-limit 6000 \
             --embedding-dim 128 --cnn-channels 96 --gru-hidden 128 \
             --batch-size 256 --seed 20261117
-      - name: Verify model bundle, class coverage, reports and 200 MB budget
+      - name: Export initial per-row INT8 model (selective INT16 safety fallback)
         run: |
-          if [ '${{ inputs.wikidata }}' = 'required' ]; then
+          python src/quantize_existing.py --source outputs/models_fp32.json --out outputs \
+            --int16-models language/linear
+      - name: Evaluate quantized model against the training held-out split
+        run: |
+          set -euo pipefail
+          if node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+              .cache/quant_eval_samples.json outputs/LOSS_REPORT.json; then
+            echo 'Initial INT8/INT16 bundle passed the <=10% relative Accuracy and Macro-F1 gate.'
+          else
+            FALLBACK=$(python - <<'PY'
+          import json
+          data=json.load(open('outputs/LOSS_REPORT.json',encoding='utf-8'))
+          fallback={'language/linear'}
+          for task,result in data['tasks'].items():
+              for model,item in result.get('models',{}).items():
+                  if model!='fusion' and not item.get('passed',False):
+                      fallback.add(task+'/'+model)
+              if result.get('models',{}).get('fusion',{}).get('passed') is False:
+                  fallback.update(task+'/'+m for m in ('linear','complement_nb','cnn','bigru'))
+          print(','.join(sorted(fallback)))
+          PY
+            )
+            echo "Retry with selective INT16 fallback: $FALLBACK"
+            python src/quantize_existing.py --source outputs/models_fp32.json --out outputs \
+              --int16-models "$FALLBACK"
+            if ! node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+                .cache/quant_eval_samples.json outputs/LOSS_REPORT.json; then
+              ALL_MODELS=$(python - <<'PY'
+          import json
+          d=json.load(open('outputs/models_fp32.json',encoding='utf-8'))
+          print(','.join(sorted(task+'/'+name for task,block in d['models'].items() for name in block['models'])))
+          PY
+              )
+              echo 'Selective fallback still exceeds the threshold; retrying all weight matrices as INT16.'
+              python src/quantize_existing.py --source outputs/models_fp32.json --out outputs \
+                --int16-models "$ALL_MODELS"
+              node tests/quant_loss_gate.js outputs/models_fp32.json outputs/models_int8.json \
+                .cache/quant_eval_samples.json outputs/LOSS_REPORT.json
+            fi
+          fi
+          python src/record_quant_report.py outputs
+      - name: Verify FP32 and quantized model bundle, class coverage and size budgets
+        run: |
+          if [ '${{ inputs.wikidata || 'required' }}' = 'required' ]; then
             python tests/verify_outputs.py outputs --require-language
           else
             python tests/verify_outputs.py outputs
@@ -114,9 +167,9 @@ jobs:
           compression-level: 6
 
   release:
-    name: Publish audited FP32 models and reports (no HTML)
+    name: Publish audited FP32 + quantized models and reports (no HTML)
     needs: train
-    if: ${{ inputs.publish_release == true }}
+    if: ${{ github.event_name == 'push' || inputs.publish_release == true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -135,14 +188,18 @@ jobs:
           test -s outputs/REPORT.md
           test -s outputs/REPORT.json
           test -s outputs/models_fp32.json
+          test -s outputs/models_int8.json
+          test -s outputs/LOSS_REPORT.json
+          test -s outputs/QUANT_AUDIT.json
           test -s outputs/train_manifest.json
           ! find outputs -type f -iname '*.html' | grep -q .
           python - <<'PY'
           from pathlib import Path
           assert Path('outputs/models_fp32.json').stat().st_size <= 200_000_000
+          assert Path('outputs/models_int8.json').stat().st_size < 15_000_000
           PY
-          zip -q -r "nszgrm-fp32-${GITHUB_RUN_ID}.zip" outputs
+          zip -q -r "nszgrm-models-${GITHUB_RUN_ID}.zip" outputs
           gh release create "research-v3-${GITHUB_RUN_ID}" \
-            "nszgrm-fp32-${GITHUB_RUN_ID}.zip" \
-            --title "NSZGRM 3类书写 + 8类语言多模型训练 · Run ${GITHUB_RUN_ID}" \
+            "nszgrm-models-${GITHUB_RUN_ID}.zip" \
+            --title "NSZGRM 3类书写 + 8类语言 FP32/量化模型 · Run ${GITHUB_RUN_ID}" \
             --notes-file outputs/REPORT.md --latest=false

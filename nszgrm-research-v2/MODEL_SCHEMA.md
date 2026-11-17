@@ -101,4 +101,26 @@ TextCNN 使用 2、3、4 字符窗口、ReLU、masked max pooling 和线性分�
 
 ## 文件体积
 
-`models_fp32.json` 的原始字节数上限为 200,000,000。训练器不在导出前量化参数。前端可另行开发量化版本，但量化文件不属于本训练包的训练输出。
+`models_fp32.json` 的原始字节数上限为 200,000,000。正式训练工作流还会生成独立的 `models_int8.json`，其量化格式见下文。
+
+
+## `models_int8.json` 量化格式（format_version=4）
+
+量化模型保留 FP32 模型的任务结构、类别顺序、温度系数和融合权重，因此前端可以沿用相同的四模型推理流程。文件名为 `models_int8.json`，但失败模型可能使用 INT16；具体精度以每个权重对象的 `quant_format` 为准。
+
+二维及更高维权重采用对称逐输出行量化。INT8 对象格式：
+
+```json
+{
+  "quant_format": "sym_int8_per_row_v1",
+  "shape": [3, 60000],
+  "scales": [0.001, 0.002, 0.003],
+  "data_b64": "..."
+}
+```
+
+INT16 使用 `sym_int16_per_row_v1`，其余字段相同。`data_b64` 按 C-order 保存有符号小端整数。还原时，先按 `shape` 展平为行，再对第 i 行的整数乘以 `scales[i]`。
+
+TF-IDF 的 vocabulary、idf、偏置、温度和融合权重保留原结构与 FP32 数值；ComplementNB 的 `feature_log_prob`、线性模型的 `coef`、CNN/BiGRU 的二维及以上 state 权重会量化。CNN/BiGRU 的一维 bias 保留 FP32。
+
+量化文件硬上限为 15,000,000 字节（严格小于）。训练器对每个模型和融合结果分别计算相对 Accuracy 与 Macro-F1 损耗，门槛均为 10%。INT8 不通过时按模型回退 INT16 并重新评测。评测数据来自训练过程预留的弱标签测试划分，不是人工金标准。
